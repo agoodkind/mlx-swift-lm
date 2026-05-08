@@ -18,17 +18,20 @@ public struct Gemma4Configuration: Codable, Sendable {
     var modelType: String = "gemma4"
     var textConfig: Gemma4TextConfiguration
     var vocabSize: Int = 262144
+    var backboneHiddenSize: Int?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case textConfig = "text_config"
         case vocabSize = "vocab_size"
+        case backboneHiddenSize = "backbone_hidden_size"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4"
         self.vocabSize = try container.decodeIfPresent(Int.self, forKey: .vocabSize) ?? 262144
+        self.backboneHiddenSize = try container.decodeIfPresent(Int.self, forKey: .backboneHiddenSize)
 
         // If text_config is present, decode from it; otherwise treat entire config as text config
         if let textConfig = try container.decodeIfPresent(
@@ -49,7 +52,8 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
     public var vocabularySize: Int { languageModel.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
-    @ModuleInfo(key: "language_model") fileprivate var languageModel: Gemma4TextModel
+    @ModuleInfo(key: "language_model") public var languageModel: Gemma4TextModel
+    public var lastHiddenState: MLXArray? { return languageModel.lastHiddenState }
 
     public init(_ config: Gemma4Configuration) {
         self._languageModel.wrappedValue = Gemma4TextModel(config.textConfig)

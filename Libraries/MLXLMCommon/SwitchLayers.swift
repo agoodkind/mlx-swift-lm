@@ -998,7 +998,7 @@ public class SwitchLinear: Module, Quantizable {
         self.outputDims = outputDims
         self.numExperts = numExperts
 
-        self._weight.wrappedValue = MLXArray.zeros([numExperts, outputDims, inputDims], type: UInt8.self)
+        self._weight.wrappedValue = MLXArray.zeros([numExperts, outputDims, inputDims], type: Float16.self)
 
         if bias {
             self._bias.wrappedValue = MLXArray.zeros([numExperts, outputDims])
@@ -1119,7 +1119,7 @@ public class SwitchLinear: Module, Quantizable {
     public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
-        var w = self.weight
+        let w = self.weight
         var result: MLXArray
         
         if let inv = self.weightScaleInv, inv.size > 0 {

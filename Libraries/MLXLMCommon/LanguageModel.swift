@@ -265,9 +265,16 @@ public protocol MTPLanguageModel: LanguageModel {
     /// - Returns: `[main_logits, mtp_0_logits, mtp_1_logits, …]`
     func callMTP(_ inputs: MLXArray, cache: [KVCache]?, mtpCaches: [[KVCache]]?) -> [MLXArray]
 
-    /// Allocate one `[KVCache]` array per MTP head so the iterator can persist
-    /// attention history between speculation rounds.
+    /// Initialize per-depth caches for the MTP heads.
+    ///
+    /// - Parameter parameters: The generation parameters.
+    /// - Returns: An array of caches, one for each MTP depth.
     func makeMTPCaches(parameters: GenerateParameters?) -> [[KVCache]]
+}
+
+/// A protocol for MTP language models that act as independent draft models but require a reference to the main model (e.g. Gemma 4 Assistant).
+public protocol DualModelMTP: MTPLanguageModel {
+    var mainModelRef: (any BaseLanguageModel)? { get set }
 }
 
 extension MTPLanguageModel {

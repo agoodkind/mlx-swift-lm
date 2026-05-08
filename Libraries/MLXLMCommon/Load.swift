@@ -81,8 +81,19 @@ public func loadWeights(
     }
 
     // apply the loaded weights
+    // When SSD streaming is active, expert weights are intentionally absent from `weights`
+    // (they are paged from NVMe on demand). Using .all would reject the load.
+    // .noUnusedKeys still catches genuinely stray/misspelled keys without requiring
+    // every @ModuleInfo slot to be populated up-front.
     let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
+    if ExpertStreamingConfig.shared.isEnabled {
+        // Expert weights are intentionally absent — paged from SSD on demand.
+        // .noUnusedKeys still rejects stray/misspelled keys without requiring
+        // every @ModuleInfo slot to be pre-populated.
+        try model.update(parameters: parameters, verify: .noUnusedKeys)
+    } else {
+        try model.update(parameters: parameters, verify: .all)
+    }
 
     if ExpertStreamingConfig.shared.isEnabled {
         // Assign tensorName to each QuantizedSwitchLinear.
@@ -137,9 +148,9 @@ public func loadWeights(
                     
                     // ALWAYS check if we have a stacked scale tensor for switch_mlp
                     let scaleKey = path + ".weight_scale_inv"
-                    print("[Load] Checking scaleKey: \(scaleKey)")
+
                     if let scaleTensor = stackedScales[scaleKey] {
-                        print("[Load] Found scaleTensor for: \(scaleKey)")
+
                         if !foundUnstacked {
                             print("[Load] WARNING: foundUnstacked is FALSE for \(scaleKey)!!! Forcing weightScaleInv.")
                         }

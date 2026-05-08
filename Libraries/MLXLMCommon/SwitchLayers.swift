@@ -1213,11 +1213,11 @@ public class SwitchLinear: Module, Quantizable {
                 let padBottom = (bs - m % bs) % bs
                 let padSide   = (bs - n % bs) % bs
                 if i == 0 {
-                    print("[SwitchLayers] computeExperts: w.shape=\(w.shape), wFp.shape=\(wFp.shape), m=\(m), n=\(n), padBottom=\(padBottom), padSide=\(padSide), outBlocks=\(outBlocks), inBlocks=\(inBlocks)")
+
                 }
                 var padded = MLX.padded(wFp, widths: [[0,0], [0, padBottom], [0, padSide]])
                 if i == 0 {
-                    print("[SwitchLayers] computeExperts: padded.shape=\(padded.shape), expected reshape: \([1, outBlocks, bs, inBlocks, bs])")
+
                 }
                 padded = padded.reshaped([1, outBlocks, bs, inBlocks, bs])
 
@@ -1229,13 +1229,13 @@ public class SwitchLinear: Module, Quantizable {
                     // Stacked: pick this expert's row and unsqueeze batch dim
                     invSlice = inv[r.id ..< r.id + 1]  // [1, outBlocks, inBlocks]
                     if i == 0 {
-                        print("[SwitchLayers] computeExperts: inv is 3D, shape=\(inv.shape), invSlice.shape=\(invSlice.shape)")
+
                     }
                 } else {
                     // Already 2D — unsqueeze for batch broadcast
                     invSlice = MLX.expandedDimensions(inv, axis: 0)  // [1, outBlocks, inBlocks]
                     if i == 0 {
-                        print("[SwitchLayers] computeExperts: inv is 2D, shape=\(inv.shape), invSlice.shape=\(invSlice.shape)")
+
                     }
                 }
 

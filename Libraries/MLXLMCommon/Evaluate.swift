@@ -1016,6 +1016,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
+    let parameters: GenerateParameters
 
     var tokenCount = 0
     let maxTokens: Int?
@@ -1052,6 +1053,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
 
         self.sampler = parameters.sampler()
         self.processor = parameters.processor()
+        self.parameters = parameters
 
         self.maxTokens = parameters.maxTokens
         self.numMTPTokens = numMTPTokens
@@ -1098,6 +1100,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
 
         // Draft generation: Use MTP logits from the previous step
         var draftTokens = [MLXArray]()
+        var draftProcessedLogits = [MLXArray]()
         if let previousMTP = mtpLogits, !previousMTP.isEmpty {
             let countToSample = Swift.min(numDraft, previousMTP.count)
             var draftProcessor = processor
@@ -1107,6 +1110,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
                 let draftToken = sampler.sample(logits: draftLogit)
                 draftProcessor?.didSample(token: draftToken)
                 draftTokens.append(draftToken)
+                draftProcessedLogits.append(draftLogit)
             }
         }
 
@@ -1154,6 +1158,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         let mainLogits = mtpResult[0]
 
         let mainTokens: MLXArray
+        var mainProcessedLogits = [MLXArray]()
         if var verifyProcessor = processor {
             // Process sequentially
             var sampled = [MLXArray]()
@@ -1163,31 +1168,93 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
                 let token = sampler.sample(logits: logits)
                 verifyProcessor.didSample(token: token)
                 sampled.append(token)
+                mainProcessedLogits.append(logits)
             }
             mainTokens = concatenated(sampled)
         } else {
             // Batch sample
             let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
             mainTokens = sampler.sample(logits: verifyLogits)
+            for i in 0 ..< (draftTokens.count + 1) {
+                mainProcessedLogits.append(verifyLogits[i ..< i + 1])
+            }
         }
 
         // We defer eval() until after we compute mtpLogits to force the graph
         let mainTokensList = mainTokens.asArray(Int.self)
         let draftTokensList = concatenated(draftTokens).asArray(Int.self)
         var accepted = 0
-        for i in 0 ..< draftTokens.count {
-            guard mainTokensList[i] == draftTokensList[i] else {
-                break
+        
+        let temp = parameters.temperature
+        let finalTokenOut: MLXArray
+        
+        if temp == 0.0 {
+            // Greedy Decoding (Exact Match = Rejection Sampling at temp 0)
+            for i in 0 ..< draftTokens.count {
+                guard mainTokensList[i] == draftTokensList[i] else {
+                    break
+                }
+                processor?.didSample(token: draftTokens[i])
+                pendingTokens.append(mainTokensList[i])
+                accepted += 1
             }
-            processor?.didSample(token: draftTokens[i])
-            pendingTokens.append(mainTokensList[i])
-            accepted += 1
+            finalTokenOut = mainTokens[accepted ... accepted]
+            processor?.didSample(token: finalTokenOut)
+            pendingTokens.append(mainTokensList[accepted])
+        } else {
+            // Probabilistic Speculative Rejection Sampling (Leviathan et al.)
+            var finalToken: MLXArray? = nil
+            for i in 0 ..< draftTokens.count {
+                let x = draftTokensList[i]
+                
+                // Force evaluation of distributions for this step
+                let pTarget = MLX.softmax(mainProcessedLogits[i] / temp, axis: -1)
+                let pDraft = MLX.softmax(draftProcessedLogits[i] / temp, axis: -1)
+                eval(pTarget, pDraft)
+                
+                // Access scalar probability (assuming logits are [1, Vocab] or [Vocab])
+                let pTargetX: Float
+                let pDraftX: Float
+                if pTarget.ndim == 2 {
+                    pTargetX = pTarget[0, x].item(Float.self)
+                    pDraftX = pDraft[0, x].item(Float.self)
+                } else {
+                    pTargetX = pTarget[x].item(Float.self)
+                    pDraftX = pDraft[x].item(Float.self)
+                }
+                
+                let acceptProb = Swift.min(1.0, pTargetX / Swift.max(pDraftX, 1e-9))
+                let u = Float.random(in: 0..<1)
+                
+                if u < acceptProb {
+                    processor?.didSample(token: draftTokens[i])
+                    pendingTokens.append(x)
+                    accepted += 1
+                } else {
+                    // Rejected! Resample from the corrected distribution
+                    var pResample = MLX.maximum(pTarget - pDraft, 0.0)
+                    let sum = pResample.sum().item(Float.self)
+                    if sum > 1e-6 {
+                        pResample = pResample / sum
+                        // categorical takes raw logits, so we convert back
+                        let resampleLogits = MLX.log(MLX.maximum(pResample, 1e-9))
+                        finalToken = MLXRandom.categorical(resampleLogits)
+                    } else {
+                        // Fallback
+                        finalToken = MLXArray(mainTokensList[i])
+                    }
+                    break
+                }
+            }
+            
+            if finalToken == nil {
+                // All drafts accepted!
+                finalToken = mainTokens[accepted ... accepted]
+            }
+            finalTokenOut = finalToken!
+            processor?.didSample(token: finalTokenOut)
+            pendingTokens.append(finalTokenOut.item(Int.self))
         }
-
-        // Always emit the main model's token at position `accepted`
-        let finalToken = mainTokens[accepted ... accepted]
-        processor?.didSample(token: finalToken)
-        pendingTokens.append(mainTokensList[accepted])
 
         // Rewind caches for rejected tokens
         let rejectedCount = draftTokens.count - accepted
@@ -1203,7 +1270,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         }
 
         // Set y for the next round
-        y = .init(tokens: finalToken)
+        y = .init(tokens: finalTokenOut)
 
         // Save future MTP logits if available
         if mtpResult.count > 1 {

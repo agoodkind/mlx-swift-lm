@@ -195,6 +195,7 @@ public class Qwen35MoEModel: Qwen35Model {
                     let wFp: MLXArray = MLXFast.fromFp8(w, dtype: .bfloat16)
                     let bs = 128
                     let (m, n) = (wFp.dim(0), wFp.dim(1))
+
                     let padBottom = (bs - m % bs) % bs
                     let padSide   = (bs - n % bs) % bs
                     var padded = MLX.padded(wFp, widths: [[0, padBottom], [0, padSide]])

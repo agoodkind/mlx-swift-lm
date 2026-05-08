@@ -511,7 +511,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
         // FP8 models are fully loaded in memory (35GB fits in 64GB UMA).
         // Bypass the SSD streaming / BATCH path completely, which is built for
         // QuantizedSwitchLinear and eager BF16 dequantization.
-        let isFP8 = gateProj.weightScaleInv != nil
+        let isFP8 = gateProj.weightScaleInv != nil && !ExpertStreamingConfig.shared.isEnabled
         if isFP8 {
             var xSorted = MLX.expandedDimensions(x, axes: [-2, -3])
             var idx = indices
@@ -528,9 +528,10 @@ public class SwitchGLU: Module, @unchecked Sendable {
             let result = downProj(intermediate, idx, sortedIndices: doSort)
             
             if doSort {
-                return MLX.squeezed(scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape), axis: -2)
+                let scattered = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+                return scattered.dim(-2) == 1 ? MLX.squeezed(scattered, axis: -2) : scattered
             }
-            return MLX.squeezed(result, axis: -2)
+            return result.dim(-2) == 1 ? MLX.squeezed(result, axis: -2) : result
         }
 
         // Stacked-buffer fused-matmul fast path (env-gated MLX_MOE_STACKED=1).
@@ -1122,12 +1123,28 @@ public class SwitchLinear: Module, Quantizable {
         var result: MLXArray
         
         if let inv = self.weightScaleInv, inv.size > 0 {
-            let numTokens = x.size / inputDims
+            var numTokens = x.size / inputDims
             if numTokens == 0 {
                 var outShape = x.shape
                 outShape[outShape.count - 1] = outputDims
                 return MLXArray.zeros(outShape).asType(x.dtype)
             }
+            
+            var x = x
+            let expectedXShape = Array(indices.shape) + [inputDims]
+            
+            // If x doesn't match the expected broadcasting shape for indices, broadcast it
+            // gatherMM natively broadcasts, but our fp8GatherGemvKernel does not.
+            if x.shape != expectedXShape && x.size < indices.size * inputDims {
+                var xToBroadcast = x
+                if x.ndim == 5 {
+                    // x is [B, S, 1, 1, D], we need [B, S, 1, D] to broadcast to [B, S, topK, D]
+                    xToBroadcast = x.reshaped([x.dim(0), x.dim(1), 1, inputDims])
+                }
+                x = MLX.broadcast(xToBroadcast, to: expectedXShape)
+            }
+            
+            numTokens = x.size / inputDims
             
             let xFlat = x.reshaped([numTokens, inputDims]).contiguous()
             let indicesFlat = indices.reshaped([numTokens]).contiguous()
@@ -1186,34 +1203,44 @@ public class SwitchLinear: Module, Quantizable {
 
             if let inv = self.weightScaleInv, inv.size > 0 {
                 // Swift MLX safetensors loader maps F8_E4M3 → uint8 (raw bit patterns).
-                // mx.load() in Python does from_fp8 automatically, producing [-448,448] range.
                 // We must call MLXFast.fromFp8 explicitly to get the same signed float values.
-                // if i == 0 { print("[SwitchLayers] computeExperts: dtype=\(w.dtype), w.shape=\(w.shape)") }
                 let wFp = MLXFast.fromFp8(w, dtype: .bfloat16)
-
-                // --- DEBUG ---
-                MLX.eval(wFp)
-                let wMax = wFp.max().item(Float.self)
-                let wMin = wFp.min().item(Float.self)
-                if wMax == 0.0 && wMin == 0.0 {
-                    print("[SwitchLayers] FATAL: wFp is ALL ZEROS! expertId=\(r.id)")
-                } else if wMax.isNaN || wMax.isInfinite || wMax > 1000.0 {
-                    print("[SwitchLayers] FATAL: wFp is CORRUPTED! max=\(wMax), min=\(wMin), expertId=\(r.id)")
-                } else {
-                    // print("[SwitchLayers] wFp max=\(wMax), min=\(wMin), expertId=\(r.id)")
-                }
+                // w is [1, outDim, inDim] (one expert loaded from SSD)
                 let bs = 128
                 let (m, n) = (wFp.dim(1), wFp.dim(2))
+                let outBlocks = (m + bs - 1) / bs
+                let inBlocks  = (n + bs - 1) / bs
                 let padBottom = (bs - m % bs) % bs
                 let padSide   = (bs - n % bs) % bs
+                if i == 0 {
+                    print("[SwitchLayers] computeExperts: w.shape=\(w.shape), wFp.shape=\(wFp.shape), m=\(m), n=\(n), padBottom=\(padBottom), padSide=\(padSide), outBlocks=\(outBlocks), inBlocks=\(inBlocks)")
+                }
                 var padded = MLX.padded(wFp, widths: [[0,0], [0, padBottom], [0, padSide]])
-                padded = padded.reshaped([wFp.dim(0), (m + padBottom) / bs, bs, (n + padSide) / bs, bs])
-                let invSlice = inv[r.id ..< r.id + 1]
-                
-                // -----------------
+                if i == 0 {
+                    print("[SwitchLayers] computeExperts: padded.shape=\(padded.shape), expected reshape: \([1, outBlocks, bs, inBlocks, bs])")
+                }
+                padded = padded.reshaped([1, outBlocks, bs, inBlocks, bs])
+
+                // inv may be:
+                //  - 3D stacked: [numExperts, outBlocks, inBlocks]  (memory-resident path)
+                //  - 2D per-expert: [outBlocks, inBlocks]           (if loaded directly)
+                let invSlice: MLXArray
+                if inv.ndim == 3 {
+                    // Stacked: pick this expert's row and unsqueeze batch dim
+                    invSlice = inv[r.id ..< r.id + 1]  // [1, outBlocks, inBlocks]
+                    if i == 0 {
+                        print("[SwitchLayers] computeExperts: inv is 3D, shape=\(inv.shape), invSlice.shape=\(invSlice.shape)")
+                    }
+                } else {
+                    // Already 2D — unsqueeze for batch broadcast
+                    invSlice = MLX.expandedDimensions(inv, axis: 0)  // [1, outBlocks, inBlocks]
+                    if i == 0 {
+                        print("[SwitchLayers] computeExperts: inv is 2D, shape=\(inv.shape), invSlice.shape=\(invSlice.shape)")
+                    }
+                }
 
                 let scaled = padded * invSlice[0..., 0..., .newAxis, 0..., .newAxis]
-                let dequantized = scaled.reshaped([wFp.dim(0), m + padBottom, n + padSide])[0..., 0 ..< m, 0 ..< n]
+                let dequantized = scaled.reshaped([1, m + padBottom, n + padSide])[0..., 0 ..< m, 0 ..< n]
                 w = dequantized.asType(x.dtype)
             } else {
                 if i == 0 { print("[SwitchLayers] computeExperts: NO weightScaleInv found! w shape=\(w.shape), dtype=\(w.dtype)") }

@@ -1117,11 +1117,8 @@ public class Gemma4AssistantModel: Module, LLMModel, DualModelMTP, KVCacheDimens
         let scatterIdx2D = selectedCanonicalShaped.reshaped([B * S, totalCandidates]).asType(.int32)
         let selectedLogits2D = selectedLogits.reshaped([B * S, totalCandidates])
         var output2D = output.reshaped([B * S, vocabSize])
-        for bsIdx in 0 ..< B * S {
-            let idxRow = scatterIdx2D[bsIdx]  // [totalCandidates]
-            let valRow = selectedLogits2D[bsIdx]  // [totalCandidates]
-            output2D[bsIdx, idxRow] = valRow
-        }
+        let rowIndices = MLXArray(0 ..< Int32(B * S)).reshaped([B * S, 1])
+        output2D[rowIndices, scatterIdx2D] = selectedLogits2D
         output = output2D.reshaped([B, S, vocabSize])
         
         return output

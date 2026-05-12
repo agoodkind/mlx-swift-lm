@@ -1227,7 +1227,13 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         
         let mtpResult = model.callMTP(verifyInput.tokens[.newAxis], cache: cache, mtpCaches: mtpCaches)
         guard !mtpResult.isEmpty else { return }
-        
+
+        // Flush the Metal command buffer immediately after the verification forward pass.
+        // On hybrid SSM/attention models (e.g. Qwen35), the recurrent SSM layers accumulate
+        // un-evaluated graph nodes across rounds. Without an explicit sync here the Metal
+        // command buffer grows until it triggers the GPU Watchdog.
+        eval(mtpResult)
+
         let mainLogits = mtpResult[0]
 
         let mainTokens: MLXArray

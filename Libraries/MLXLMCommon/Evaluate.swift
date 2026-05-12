@@ -503,6 +503,8 @@ protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int 
     var tokenCount: Int { get }
     var promptPrefillTime: TimeInterval { get }
     var streamingError: SSDStreamingError? { get }
+    var acceptedDraftTokens: Int { get }
+    var totalDraftTokens: Int { get }
 }
 
 /// Generator of tokens.
@@ -549,6 +551,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     var promptPrefillTime: TimeInterval = 0.0
     var streamingError: SSDStreamingError?
     let ssdErrorLatch = SSDStreamingErrorLatch()
+    var acceptedDraftTokens = 0
+    var totalDraftTokens = 0
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
@@ -794,6 +798,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
+    var acceptedDraftTokens = 0
+    var totalDraftTokens = 0
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -1013,6 +1019,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         // Rewind caches for rejected tokens
         trimPromptCache(mainCache, numTokens: numDraft - accepted)
         trimPromptCache(draftCache, numTokens: Swift.max(numDraft - accepted - 1, 0))
+
+        self.acceptedDraftTokens += accepted
+        self.totalDraftTokens += draftTokens.count
 
         // Apply dynamic cache quantization after rewind
         quantizeKVCache(&mainCache)
@@ -2228,7 +2237,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 generationTokenCount: tokenCount,
                 promptTime: promptTime + iterator.promptPrefillTime,
                 generationTime: generateTime,
-                stopReason: stopReason ?? .cancelled
+                stopReason: stopReason ?? .cancelled,
+                acceptedDraftTokens: iterator.acceptedDraftTokens,
+                totalDraftTokens: iterator.totalDraftTokens
             )
             _ = continuation.yield(handler.infoEvent(info))
 
@@ -2298,6 +2309,12 @@ public struct GenerateCompletionInfo: Sendable {
     /// Reason generation stopped.
     public let stopReason: GenerateStopReason
 
+    /// Number of accepted draft tokens (if speculative decoding is active).
+    public let acceptedDraftTokens: Int
+
+    /// Total number of draft tokens evaluated (if speculative decoding is active).
+    public let totalDraftTokens: Int
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -2313,13 +2330,17 @@ public struct GenerateCompletionInfo: Sendable {
         generationTokenCount: Int,
         promptTime: TimeInterval,
         generationTime: TimeInterval,
-        stopReason: GenerateStopReason = .stop
+        stopReason: GenerateStopReason = .stop,
+        acceptedDraftTokens: Int = 0,
+        totalDraftTokens: Int = 0
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
         self.promptTime = promptTime
         self.generateTime = generationTime
         self.stopReason = stopReason
+        self.acceptedDraftTokens = acceptedDraftTokens
+        self.totalDraftTokens = totalDraftTokens
     }
 
     public func summary() -> String {

@@ -171,32 +171,33 @@ public class SwitchGLU: Module, @unchecked Sendable {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
         guard idx.size <= 32,
-              let qGate = gateProj as? QuantizedSwitchLinear,
-              let qUp = upProj as? QuantizedSwitchLinear,
-              let qDown = downProj as? QuantizedSwitchLinear,
-              let gateSSD = qGate.resolveSSDInfo(),
-              let upSSD = qUp.resolveSSDInfo(),
-              let downSSD = qDown.resolveSSDInfo() else {
+              gateProj is QuantizedSwitchLinear,
+              upProj is QuantizedSwitchLinear,
+              downProj is QuantizedSwitchLinear,
+              let gateSSD = gateProj.resolveSSDInfo(),
+              let upSSD = upProj.resolveSSDInfo(),
+              let downSSD = downProj.resolveSSDInfo() else {
             return nil  // ineligible — fall through to legacy path
         }
 
         let CACHE_SLOTS = SwitchGLU.MAX_CACHE_SLOTS
         let isFused = SwitchGLU.useFusedGateUp
 
-        // ── Cold-path allocation ──
         if _stackedGate == nil && _stackedGateUp == nil {
             if isFused {
                 // Combined gate+up buffer: shape [CACHE_SLOTS, 2*intermediate, hidden].
                 _stackedGateUp = MLXArray.zeros(
-                    [CACHE_SLOTS, 2 * qGate.weight.dim(1), qGate.weight.dim(2)]
-                ).asType(qGate.weight.dtype)
+                    [CACHE_SLOTS, 2 * gateProj.weight.dim(1), gateProj.weight.dim(2)]
+                ).asType(gateProj.weight.dtype)
                 _stackedDown = MLXArray.zeros(
-                    [CACHE_SLOTS, qDown.weight.dim(1), qDown.weight.dim(2)]
-                ).asType(qDown.weight.dtype)
+                    [CACHE_SLOTS, downProj.weight.dim(1), downProj.weight.dim(2)]
+                ).asType(downProj.weight.dtype)
                 // Pre-concatenate gate+up scales/biases (one-time at cold init).
-                _combinedGateUpScales = MLX.concatenated([qGate.scales, qUp.scales], axis: 1)
-                if let gb = qGate.biases, let ub = qUp.biases {
-                    _combinedGateUpBiases = MLX.concatenated([gb, ub], axis: 1)
+                if let qGate = gateProj as? QuantizedSwitchLinear, let qUp = upProj as? QuantizedSwitchLinear {
+                    _combinedGateUpScales = MLX.concatenated([qGate.scales, qUp.scales], axis: 1)
+                    if let gb = qGate.biases, let ub = qUp.biases {
+                        _combinedGateUpBiases = MLX.concatenated([gb, ub], axis: 1)
+                    }
                 }
                 _slotExpert = Array(repeating: nil, count: CACHE_SLOTS)
                 _slotLastUsed = Array(repeating: 0, count: CACHE_SLOTS)
@@ -209,14 +210,14 @@ public class SwitchGLU: Module, @unchecked Sendable {
                 _stackedDownBytesPerExpert = _stackedDown!.nbytes / CACHE_SLOTS
             } else {
                 _stackedGate = MLXArray.zeros(
-                    [CACHE_SLOTS, qGate.weight.dim(1), qGate.weight.dim(2)]
-                ).asType(qGate.weight.dtype)
+                    [CACHE_SLOTS, gateProj.weight.dim(1), gateProj.weight.dim(2)]
+                ).asType(gateProj.weight.dtype)
                 _stackedUp = MLXArray.zeros(
-                    [CACHE_SLOTS, qUp.weight.dim(1), qUp.weight.dim(2)]
-                ).asType(qUp.weight.dtype)
+                    [CACHE_SLOTS, upProj.weight.dim(1), upProj.weight.dim(2)]
+                ).asType(upProj.weight.dtype)
                 _stackedDown = MLXArray.zeros(
-                    [CACHE_SLOTS, qDown.weight.dim(1), qDown.weight.dim(2)]
-                ).asType(qDown.weight.dtype)
+                    [CACHE_SLOTS, downProj.weight.dim(1), downProj.weight.dim(2)]
+                ).asType(downProj.weight.dtype)
                 _slotExpert = Array(repeating: nil, count: CACHE_SLOTS)
                 _slotLastUsed = Array(repeating: 0, count: CACHE_SLOTS)
                 _tokenCounter = 0
@@ -280,28 +281,31 @@ public class SwitchGLU: Module, @unchecked Sendable {
                 let info = specTargets[mIdx]
                 switch proj {
                 case 0:
+                    let ssd = self.gateProj.resolveSSDInfo(expertIndex: info.expertId) ?? (gateSSD.path, gateSSD.tensorName, UInt32(info.expertId))
                     if isFused {
                         // Gate -> first half of slot in combined buffer.
                         let off = info.slot * 2 * bpe
-                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: gateSSD.path,
-                                                tensorName: gateSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: off)
+                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: ssd.path,
+                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: off)
                     } else {
-                        MLXFast.preadIntoOffset(self._stackedGate!, safetensorsPath: gateSSD.path,
-                                                tensorName: gateSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: info.slot * bpe)
+                        MLXFast.preadIntoOffset(self._stackedGate!, safetensorsPath: ssd.path,
+                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * bpe)
                     }
                 case 1:
+                    let ssd = self.upProj.resolveSSDInfo(expertIndex: info.expertId) ?? (upSSD.path, upSSD.tensorName, UInt32(info.expertId))
                     if isFused {
                         // Up -> second half of slot in combined buffer.
                         let off = info.slot * 2 * bpe + bpe
-                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: upSSD.path,
-                                                tensorName: upSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: off)
+                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: ssd.path,
+                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: off)
                     } else {
-                        MLXFast.preadIntoOffset(self._stackedUp!, safetensorsPath: upSSD.path,
-                                                tensorName: upSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: info.slot * bpe)
+                        MLXFast.preadIntoOffset(self._stackedUp!, safetensorsPath: ssd.path,
+                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * bpe)
                     }
                 default:
-                    MLXFast.preadIntoOffset(self._stackedDown!, safetensorsPath: downSSD.path,
-                                            tensorName: downSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: info.slot * downBpe)
+                    let ssd = self.downProj.resolveSSDInfo(expertIndex: info.expertId) ?? (downSSD.path, downSSD.tensorName, UInt32(info.expertId))
+                    MLXFast.preadIntoOffset(self._stackedDown!, safetensorsPath: ssd.path,
+                                            tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * downBpe)
                 }
                 }
             }
@@ -310,7 +314,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
 
         if idx.size == 0 {
             var outShape = x.shape
-            outShape[outShape.count - 1] = qDown.outputDims
+            outShape[outShape.count - 1] = downProj.outputDims
             let result = MLXArray.zeros(outShape).asType(.float16)
             if doSort {
                 return MLX.squeezed(scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape), axis: -2)
@@ -376,6 +380,14 @@ public class SwitchGLU: Module, @unchecked Sendable {
         if !missesNeedingPread.isEmpty {
             let bpe = _stackedBytesPerExpert
             let downBpe = _stackedDownBytesPerExpert
+            
+            // SYNCHRONIZATION POINT
+            // Ensure the GPU has finished reading the stacked buffers from the previous token's
+            // computeExpertsFused before we overwrite those slots with new expert weights from the SSD.
+            Stream.gpu.synchronize()
+            print("[SwitchLayers] SSD Sync: GPU drained. Misses=\(missesNeedingPread.count)")
+            fflush(stdout)
+            
             let errState = ThreadSafeError()
             DispatchQueue.concurrentPerform(iterations: missesNeedingPread.count * 3) { [missesNeedingPread] i in
                 errState.catchError {
@@ -384,26 +396,29 @@ public class SwitchGLU: Module, @unchecked Sendable {
                 let info = missesNeedingPread[mIdx]
                 switch proj {
                 case 0:
+                    let ssd = self.gateProj.resolveSSDInfo(expertIndex: info.expertId) ?? (gateSSD.path, gateSSD.tensorName, UInt32(info.expertId))
                     if isFused {
                         let off = info.slot * 2 * bpe
-                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: gateSSD.path,
-                                                tensorName: gateSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: off)
+                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: ssd.path,
+                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: off)
                     } else {
-                        MLXFast.preadIntoOffset(self._stackedGate!, safetensorsPath: gateSSD.path,
-                                                tensorName: gateSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: info.slot * bpe)
+                        MLXFast.preadIntoOffset(self._stackedGate!, safetensorsPath: ssd.path,
+                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * bpe)
                     }
                 case 1:
+                    let ssd = self.upProj.resolveSSDInfo(expertIndex: info.expertId) ?? (upSSD.path, upSSD.tensorName, UInt32(info.expertId))
                     if isFused {
                         let off = info.slot * 2 * bpe + bpe
-                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: upSSD.path,
-                                                tensorName: upSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: off)
+                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: ssd.path,
+                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: off)
                     } else {
-                        MLXFast.preadIntoOffset(self._stackedUp!, safetensorsPath: upSSD.path,
-                                                tensorName: upSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: info.slot * bpe)
+                        MLXFast.preadIntoOffset(self._stackedUp!, safetensorsPath: ssd.path,
+                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * bpe)
                     }
                 default:
-                    MLXFast.preadIntoOffset(self._stackedDown!, safetensorsPath: downSSD.path,
-                                            tensorName: downSSD.tensorName, expertIndex: UInt32(info.expertId), dstOffset: info.slot * downBpe)
+                    let ssd = self.downProj.resolveSSDInfo(expertIndex: info.expertId) ?? (downSSD.path, downSSD.tensorName, UInt32(info.expertId))
+                    MLXFast.preadIntoOffset(self._stackedDown!, safetensorsPath: ssd.path,
+                                            tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * downBpe)
                 }
                 }
             }
@@ -426,18 +441,18 @@ public class SwitchGLU: Module, @unchecked Sendable {
             // SINGLE matmul over combined gate+up buffer; split the output into halves.
             let (xGate, xUp) = self.runFusedGateUpMatmul(
                 x: x,
-                qGate: qGate,
+                gateProj: gateProj,
                 slotPerToken: slotPerToken,
                 slotExperts: slotExperts)
             intermediate = activation(xGate) * xUp
         } else {
-            let xGate = qGate.computeExpertsFused(x, stackedBuffer: _stackedGate!,
+            let xGate = gateProj.computeExpertsFused(x, stackedBuffer: _stackedGate!,
                                                   slotPerToken: slotPerToken, slotExperts: slotExperts)
-            let xUp = qUp.computeExpertsFused(x, stackedBuffer: _stackedUp!,
+            let xUp = upProj.computeExpertsFused(x, stackedBuffer: _stackedUp!,
                                               slotPerToken: slotPerToken, slotExperts: slotExperts)
             intermediate = activation(xGate) * xUp
         }
-        x = qDown.computeExpertsFused(intermediate, stackedBuffer: _stackedDown!,
+        x = downProj.computeExpertsFused(intermediate, stackedBuffer: _stackedDown!,
                                       slotPerToken: slotPerToken, slotExperts: slotExperts)
 
         if doSort {
@@ -453,14 +468,15 @@ public class SwitchGLU: Module, @unchecked Sendable {
     /// Pre-conditions (guaranteed by `runStackedFastPath` cold init when
     /// `useFusedGateUp` is true):
     ///   - `_stackedGateUp` populated with gate -> first half, up -> second half per slot
-    ///   - `_combinedGateUpScales` = `concat(qGate.scales, qUp.scales, axis: 1)`
-    ///   - `_combinedGateUpBiases` = `concat(qGate.biases, qUp.biases, axis: 1)` (or nil)
+    ///   - `_combinedGateUpScales` = `concat(gateProj.scales, upProj.scales, axis: 1)`
+    ///   - `_combinedGateUpBiases` = `concat(gateProj.biases, upProj.biases, axis: 1)` (or nil)
     private func runFusedGateUpMatmul(
         x: MLXArray,
-        qGate: QuantizedSwitchLinear,
+        gateProj: SwitchLinear,
         slotPerToken: MLXArray,
         slotExperts: [Int32]
     ) -> (MLXArray, MLXArray) {
+        let qGate = gateProj as! QuantizedSwitchLinear
         let slotExpertsMLX = MLXArray(slotExperts).asType(.uint32)
         // Gather the combined scales/biases for the experts currently in our slots.
         // _combinedGateUpScales is [numExperts, 2 * intermediate, hidden / groupSize].
@@ -494,6 +510,33 @@ public class SwitchGLU: Module, @unchecked Sendable {
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        // ── FP8 Memory-Resident Path ──
+        // FP8 models are fully loaded in memory (35GB fits in 64GB UMA).
+        // Bypass the SSD streaming / BATCH path completely, which is built for
+        // QuantizedSwitchLinear and eager BF16 dequantization.
+        let isFP8 = gateProj.weightScaleInv != nil && !ExpertStreamingConfig.shared.isEnabled
+        if isFP8 {
+            var xSorted = MLX.expandedDimensions(x, axes: [-2, -3])
+            var idx = indices
+            var inverseOrder = MLXArray()
+            
+            let doSort = indices.size >= 64
+            if doSort {
+                (xSorted, idx, inverseOrder) = gatherSort(x: xSorted, indices: indices)
+            }
+            
+            let xGate = gateProj(xSorted, idx, sortedIndices: doSort)
+            let xUp = upProj(xSorted, idx, sortedIndices: doSort)
+            let intermediate = self.activation(xGate) * xUp
+            let result = downProj(intermediate, idx, sortedIndices: doSort)
+            
+            if doSort {
+                let scattered = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+                return scattered.dim(-2) == 1 ? MLX.squeezed(scattered, axis: -2) : scattered
+            }
+            return result.dim(-2) == 1 ? MLX.squeezed(result, axis: -2) : result
+        }
+
         // Stacked-buffer fused-matmul fast path (env-gated MLX_MOE_STACKED=1).
         // Early-out into the stacked path when applicable; otherwise fall
         // through to the existing SSD-streaming / legacy code below.
@@ -528,12 +571,9 @@ public class SwitchGLU: Module, @unchecked Sendable {
         //   - NO final eval — next layer's eval(idx) forces this layer
         // This reduces from 4 evals/layer (original) to 1 eval/layer.
         if isSSDStreaming,
-           let qGate = gateProj as? QuantizedSwitchLinear,
-           let qUp = upProj as? QuantizedSwitchLinear,
-           let qDown = downProj as? QuantizedSwitchLinear,
-           let gateSSD = qGate.resolveSSDInfo(),
-           let upSSD = qUp.resolveSSDInfo(),
-           let downSSD = qDown.resolveSSDInfo() {
+           let gateSSD = gateProj.resolveSSDInfo(),
+           let upSSD = upProj.resolveSSDInfo(),
+           let downSSD = downProj.resolveSSDInfo() {
 
             // ── EVAL REDUCTION STRATEGY ──────────────────────────────────────
             // For single-token generation (idx.size ≤ 32), we merge the sorted-
@@ -567,9 +607,9 @@ public class SwitchGLU: Module, @unchecked Sendable {
 
                 if _persistentGate == nil {
                     // ── COLD PATH: first token, allocate persistent buffers ──
-                    _persistentGate = qGate.allocateExpertBuffers(maxBuffers)
-                    _persistentUp = qUp.allocateExpertBuffers(maxBuffers)
-                    _persistentDown = qDown.allocateExpertBuffers(maxBuffers)
+                    _persistentGate = gateProj.allocateExpertBuffers(maxBuffers)
+                    _persistentUp = upProj.allocateExpertBuffers(maxBuffers)
+                    _persistentDown = downProj.allocateExpertBuffers(maxBuffers)
 
 
                     // Merged eval: idx + buffer allocations (same as ssd-opt-v1)
@@ -582,7 +622,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
                     // Handle empty indices
                     if idx.size == 0 {
                         var outShape = x.shape
-                        outShape[outShape.count - 1] = qDown.outputDims
+                        outShape[outShape.count - 1] = downProj.outputDims
                         let result = MLXArray.zeros(outShape).asType(.float16)
                         if doSort {
                             return MLX.squeezed(scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape), axis: -2)
@@ -612,14 +652,17 @@ public class SwitchGLU: Module, @unchecked Sendable {
                         let r = ranges[expertIdx]
                         switch projIdx {
                         case 0:
-                            MLXFast.preadInto(self._persistentGate![expertIdx], safetensorsPath: gateSSD.path,
-                                              tensorName: gateSSD.tensorName, expertIndex: UInt32(r.id))
+                            let ssd = self.gateProj.resolveSSDInfo(expertIndex: r.id) ?? (gateSSD.path, gateSSD.tensorName, UInt32(r.id))
+                            MLXFast.preadInto(self._persistentGate![expertIdx], safetensorsPath: ssd.path,
+                                              tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                         case 1:
-                            MLXFast.preadInto(self._persistentUp![expertIdx], safetensorsPath: upSSD.path,
-                                              tensorName: upSSD.tensorName, expertIndex: UInt32(r.id))
+                            let ssd = self.upProj.resolveSSDInfo(expertIndex: r.id) ?? (upSSD.path, upSSD.tensorName, UInt32(r.id))
+                            MLXFast.preadInto(self._persistentUp![expertIdx], safetensorsPath: ssd.path,
+                                              tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                         default:
-                            MLXFast.preadInto(self._persistentDown![expertIdx], safetensorsPath: downSSD.path,
-                                              tensorName: downSSD.tensorName, expertIndex: UInt32(r.id))
+                            let ssd = self.downProj.resolveSSDInfo(expertIndex: r.id) ?? (downSSD.path, downSSD.tensorName, UInt32(r.id))
+                            MLXFast.preadInto(self._persistentDown![expertIdx], safetensorsPath: ssd.path,
+                                              tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                         }
                         }
                     }
@@ -632,10 +675,10 @@ public class SwitchGLU: Module, @unchecked Sendable {
                     let usedGate = Array(_persistentGate![0..<ranges.count])
                     let usedUp = Array(_persistentUp![0..<ranges.count])
                     let usedDown = Array(_persistentDown![0..<ranges.count])
-                    let xGate = qGate.computeExperts(x, buffers: usedGate, ranges: ranges)
-                    let xUp = qUp.computeExperts(x, buffers: usedUp, ranges: ranges)
+                    let xGate = gateProj.computeExperts(x, buffers: usedGate, ranges: ranges)
+                    let xUp = upProj.computeExperts(x, buffers: usedUp, ranges: ranges)
                     let intermediate = activation(xGate) * xUp
-                    x = qDown.computeExperts(intermediate, buffers: usedDown, ranges: ranges)
+                    x = downProj.computeExperts(intermediate, buffers: usedDown, ranges: ranges)
 
                 } else {
                     // ── WARM PATH: asyncEval + speculative pread pipeline ──
@@ -660,14 +703,17 @@ public class SwitchGLU: Module, @unchecked Sendable {
                             let expertId = prevIds[slot]
                             switch proj {
                             case 0:
-                                MLXFast.preadInto(self._persistentGate![slot], safetensorsPath: gateSSD.path,
-                                                  tensorName: gateSSD.tensorName, expertIndex: UInt32(expertId))
+                                let ssd = self.gateProj.resolveSSDInfo(expertIndex: expertId) ?? (gateSSD.path, gateSSD.tensorName, UInt32(expertId))
+                                MLXFast.preadInto(self._persistentGate![slot], safetensorsPath: ssd.path,
+                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                             case 1:
-                                MLXFast.preadInto(self._persistentUp![slot], safetensorsPath: upSSD.path,
-                                                  tensorName: upSSD.tensorName, expertIndex: UInt32(expertId))
+                                let ssd = self.upProj.resolveSSDInfo(expertIndex: expertId) ?? (upSSD.path, upSSD.tensorName, UInt32(expertId))
+                                MLXFast.preadInto(self._persistentUp![slot], safetensorsPath: ssd.path,
+                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                             default:
-                                MLXFast.preadInto(self._persistentDown![slot], safetensorsPath: downSSD.path,
-                                                  tensorName: downSSD.tensorName, expertIndex: UInt32(expertId))
+                                let ssd = self.downProj.resolveSSDInfo(expertIndex: expertId) ?? (downSSD.path, downSSD.tensorName, UInt32(expertId))
+                                MLXFast.preadInto(self._persistentDown![slot], safetensorsPath: ssd.path,
+                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                             }
                             }
                         }
@@ -677,7 +723,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
                     // Sync on idx (blocks until GPU finishes attention + router)
                     if idx.size == 0 {
                         var outShape = x.shape
-                        outShape[outShape.count - 1] = qDown.outputDims
+                        outShape[outShape.count - 1] = downProj.outputDims
                         let result = MLXArray.zeros(outShape).asType(.float16)
                         if doSort {
                             return MLX.squeezed(scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape), axis: -2)
@@ -749,20 +795,23 @@ public class SwitchGLU: Module, @unchecked Sendable {
                                 let info = missInfo[mIdx]
                                 switch proj {
                                 case 0:
+                                    let ssd = self.gateProj.resolveSSDInfo(expertIndex: info.expertId) ?? (gateSSD.path, gateSSD.tensorName, UInt32(info.expertId))
                                     MLXFast.preadInto(self._persistentGate![info.bufferSlot],
-                                                      safetensorsPath: gateSSD.path,
-                                                      tensorName: gateSSD.tensorName,
-                                                      expertIndex: UInt32(info.expertId))
+                                                      safetensorsPath: ssd.path,
+                                                      tensorName: ssd.tensorName,
+                                                      expertIndex: ssd.readIndex)
                                 case 1:
+                                    let ssd = self.upProj.resolveSSDInfo(expertIndex: info.expertId) ?? (upSSD.path, upSSD.tensorName, UInt32(info.expertId))
                                     MLXFast.preadInto(self._persistentUp![info.bufferSlot],
-                                                      safetensorsPath: upSSD.path,
-                                                      tensorName: upSSD.tensorName,
-                                                      expertIndex: UInt32(info.expertId))
+                                                      safetensorsPath: ssd.path,
+                                                      tensorName: ssd.tensorName,
+                                                      expertIndex: ssd.readIndex)
                                 default:
+                                    let ssd = self.downProj.resolveSSDInfo(expertIndex: info.expertId) ?? (downSSD.path, downSSD.tensorName, UInt32(info.expertId))
                                     MLXFast.preadInto(self._persistentDown![info.bufferSlot],
-                                                      safetensorsPath: downSSD.path,
-                                                      tensorName: downSSD.tensorName,
-                                                      expertIndex: UInt32(info.expertId))
+                                                      safetensorsPath: ssd.path,
+                                                      tensorName: ssd.tensorName,
+                                                      expertIndex: ssd.readIndex)
                                 }
                                 }
                             }
@@ -789,14 +838,17 @@ public class SwitchGLU: Module, @unchecked Sendable {
                             let r = ranges[expertIdx]
                             switch projIdx {
                             case 0:
-                                MLXFast.preadInto(self._persistentGate![expertIdx], safetensorsPath: gateSSD.path,
-                                                  tensorName: gateSSD.tensorName, expertIndex: UInt32(r.id))
+                                let ssd = self.gateProj.resolveSSDInfo(expertIndex: r.id) ?? (gateSSD.path, gateSSD.tensorName, UInt32(r.id))
+                                MLXFast.preadInto(self._persistentGate![expertIdx], safetensorsPath: ssd.path,
+                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                             case 1:
-                                MLXFast.preadInto(self._persistentUp![expertIdx], safetensorsPath: upSSD.path,
-                                                  tensorName: upSSD.tensorName, expertIndex: UInt32(r.id))
+                                let ssd = self.upProj.resolveSSDInfo(expertIndex: r.id) ?? (upSSD.path, upSSD.tensorName, UInt32(r.id))
+                                MLXFast.preadInto(self._persistentUp![expertIdx], safetensorsPath: ssd.path,
+                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                             default:
-                                MLXFast.preadInto(self._persistentDown![expertIdx], safetensorsPath: downSSD.path,
-                                                  tensorName: downSSD.tensorName, expertIndex: UInt32(r.id))
+                                let ssd = self.downProj.resolveSSDInfo(expertIndex: r.id) ?? (downSSD.path, downSSD.tensorName, UInt32(r.id))
+                                MLXFast.preadInto(self._persistentDown![expertIdx], safetensorsPath: ssd.path,
+                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                             }
                             }
                         }
@@ -807,10 +859,10 @@ public class SwitchGLU: Module, @unchecked Sendable {
                     _previousExpertIds = actualIds
 
                     // Lazy compute (no eval — next layer forces it)
-                    let xGate = qGate.computeExperts(x, buffers: usedGate, ranges: ranges)
-                    let xUp = qUp.computeExperts(x, buffers: usedUp, ranges: ranges)
+                    let xGate = gateProj.computeExperts(x, buffers: usedGate, ranges: ranges)
+                    let xUp = upProj.computeExperts(x, buffers: usedUp, ranges: ranges)
                     let intermediate = activation(xGate) * xUp
-                    x = qDown.computeExperts(intermediate, buffers: usedDown, ranges: ranges)
+                    x = downProj.computeExperts(intermediate, buffers: usedDown, ranges: ranges)
                 }
 
             } else {
@@ -821,7 +873,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
                 // Handle empty indices
                 if idx.size == 0 {
                     var outShape = x.shape
-                    outShape[outShape.count - 1] = qDown.outputDims
+                    outShape[outShape.count - 1] = downProj.outputDims
                     let result = MLXArray.zeros(outShape).asType(.float16)
                     if doSort {
                         return MLX.squeezed(scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape), axis: -2)
@@ -842,9 +894,9 @@ public class SwitchGLU: Module, @unchecked Sendable {
                 }
 
                 // Allocate exact buffer count and eval
-                let gateBuffers = qGate.allocateExpertBuffers(ranges.count)
-                let upBuffers = qUp.allocateExpertBuffers(ranges.count)
-                let downBuffers = qDown.allocateExpertBuffers(ranges.count)
+                let gateBuffers = gateProj.allocateExpertBuffers(ranges.count)
+                let upBuffers = upProj.allocateExpertBuffers(ranges.count)
+                let downBuffers = downProj.allocateExpertBuffers(ranges.count)
                 MLX.eval(gateBuffers + upBuffers + downBuffers)
 
                 // Concurrent pread (same as fast path)
@@ -857,24 +909,27 @@ public class SwitchGLU: Module, @unchecked Sendable {
                     let r = ranges[expertIdx]
                     switch projIdx {
                     case 0:
-                        MLXFast.preadInto(gateBuffers[expertIdx], safetensorsPath: gateSSD.path,
-                                          tensorName: gateSSD.tensorName, expertIndex: UInt32(r.id))
+                        let ssd = self.gateProj.resolveSSDInfo(expertIndex: r.id) ?? (gateSSD.path, gateSSD.tensorName, UInt32(r.id))
+                        MLXFast.preadInto(gateBuffers[expertIdx], safetensorsPath: ssd.path,
+                                          tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                     case 1:
-                        MLXFast.preadInto(upBuffers[expertIdx], safetensorsPath: upSSD.path,
-                                          tensorName: upSSD.tensorName, expertIndex: UInt32(r.id))
+                        let ssd = self.upProj.resolveSSDInfo(expertIndex: r.id) ?? (upSSD.path, upSSD.tensorName, UInt32(r.id))
+                        MLXFast.preadInto(upBuffers[expertIdx], safetensorsPath: ssd.path,
+                                          tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                     default:
-                        MLXFast.preadInto(downBuffers[expertIdx], safetensorsPath: downSSD.path,
-                                          tensorName: downSSD.tensorName, expertIndex: UInt32(r.id))
+                        let ssd = self.downProj.resolveSSDInfo(expertIndex: r.id) ?? (downSSD.path, downSSD.tensorName, UInt32(r.id))
+                        MLXFast.preadInto(downBuffers[expertIdx], safetensorsPath: ssd.path,
+                                          tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
                     }
                     }
                 }
                 errState.check()
 
                 // Lazy compute (no eval — next layer forces it)
-                let xGate = qGate.computeExperts(x, buffers: gateBuffers, ranges: ranges)
-                let xUp = qUp.computeExperts(x, buffers: upBuffers, ranges: ranges)
+                let xGate = gateProj.computeExperts(x, buffers: gateBuffers, ranges: ranges)
+                let xUp = upProj.computeExperts(x, buffers: upBuffers, ranges: ranges)
                 let intermediate = activation(xGate) * xUp
-                x = qDown.computeExperts(intermediate, buffers: downBuffers, ranges: ranges)
+                x = downProj.computeExperts(intermediate, buffers: downBuffers, ranges: ranges)
             }
 
             if doSort {
@@ -902,26 +957,58 @@ public class SwitchGLU: Module, @unchecked Sendable {
 public class SwitchLinear: Module, Quantizable {
     @ModuleInfo(key: "weight") public var weight: MLXArray
     @ModuleInfo(key: "bias") public var bias: MLXArray?
+    public var weightScaleInv: MLXArray?
+
+    // SSD streaming map for unstacked experts: expertId -> (path, tensorName)
+    public var unstackedSSDMap: [Int: (path: String, tensorName: String)]?
+    public var tensorName: String?
 
     public let inputDims: Int
     public let outputDims: Int
     public let numExperts: Int
+
+    public func resolveSSDInfo() -> (path: String, tensorName: String)? {
+        #if os(macOS)
+        guard ExpertStreamingConfig.shared.useDirectNVMe else { return nil }
+        if let map = unstackedSSDMap, let first = map[0] {
+            return (first.path, first.tensorName)
+        }
+        guard let tName = self.tensorName,
+              let filename = ExpertStreamerManager.shared?.getFile(for: tName),
+              let dir = ExpertStreamingConfig.shared.modelDirectory else { return nil }
+        let path = dir.appendingPathComponent(filename).path
+        return (path, tName)
+        #else
+        return nil
+        #endif
+    }
+
+    public func resolveSSDInfo(expertIndex: Int) -> (path: String, tensorName: String, readIndex: UInt32)? {
+        #if os(macOS)
+        guard ExpertStreamingConfig.shared.useDirectNVMe else { return nil }
+        if let unstacked = self.unstackedSSDMap?[expertIndex] {
+            return (unstacked.path, unstacked.tensorName, 0)
+        }
+        guard let base = resolveSSDInfo() else { return nil }
+        return (base.path, base.tensorName, UInt32(expertIndex))
+        #else
+        return nil
+        #endif
+    }
 
     public init(inputDims: Int, outputDims: Int, numExperts: Int, bias: Bool = true) {
         self.inputDims = inputDims
         self.outputDims = outputDims
         self.numExperts = numExperts
 
-        let scale = sqrt(1.0 / Float(inputDims))
-        self._weight.wrappedValue = MLXRandom.uniform(
-            low: -scale,
-            high: scale,
-            [numExperts, outputDims, inputDims]
-        )
+        self._weight.wrappedValue = MLXArray.zeros([numExperts, outputDims, inputDims], type: Float16.self)
 
         if bias {
             self._bias.wrappedValue = MLXArray.zeros([numExperts, outputDims])
         }
+
+        // weightScaleInv is a plain var (not @ModuleInfo), populated dynamically.
+        // Expert weights are pre-dequanted in sanitize; no loader population needed.
 
         super.init()
     }
@@ -941,18 +1028,320 @@ public class SwitchLinear: Module, Quantizable {
         self._weight.wrappedValue = weight
         self._bias.wrappedValue = bias
     }
-
+    
+    private lazy var fp8GatherGemvKernel = {
+        let metalSource = """
+            uint base_row = threadgroup_position_in_grid.x * ROWS_PER_TG;
+            uint token_idx = threadgroup_position_in_grid.y;
+            uint ti_idx = thread_position_in_threadgroup.x;
+            uint tg_size = threads_per_threadgroup.x;
+            
+            int expert_idx = indices[token_idx];
+            if (expert_idx < 0 || expert_idx >= NUM_EXPERTS) {
+                if (ti_idx == 0) {
+                    for (uint r = 0; r < ROWS_PER_TG; r++) {
+                        uint row = base_row + r;
+                        if (row < OUT_DIM) out[token_idx * OUT_DIM + row] = (bfloat)0.0f;
+                    }
+                }
+                return;
+            }
+            
+            int scale_cols = (IN_DIM + BS - 1) / BS;
+            int scale_expert_offset = expert_idx * ((OUT_DIM + BS - 1)/BS) * scale_cols;
+            int w_expert_offset = expert_idx * OUT_DIM * IN_DIM;
+            
+            device const uint8_t *w_expert = (device const uint8_t *)w + w_expert_offset;
+            device const bfloat *scales_expert = (device const bfloat *)scales + scale_expert_offset;
+            device const bfloat *x_token = (device const bfloat *)x + token_idx * IN_DIM;
+            
+            for (uint r = 0; r < ROWS_PER_TG; r++) {
+                uint row = base_row + r;
+                if (row >= OUT_DIM) continue;
+                
+                float sum = 0.0f;
+                for (int col = ti_idx; col < IN_DIM; col += tg_size) {
+                    int scale_idx = (row / BS) * scale_cols + (col / BS);
+                    float scale_val = (float)scales_expert[scale_idx];
+                    
+                    uint8_t w_byte = w_expert[row * IN_DIM + col];
+                    
+                    float w_val = 0.0f;
+                    if (w_byte != 0 && w_byte != 0x80) {
+                        uint s = (w_byte >> 7) & 1;
+                        uint e = (w_byte >> 3) & 0xF;
+                        uint m = w_byte & 0x7;
+                        float sign = s ? -1.0f : 1.0f;
+                        if (e == 0) {
+                            w_val = sign * exp2(-6.0f) * (m / 8.0f);
+                        } else if (!(e == 15 && m == 7)) {
+                            w_val = sign * exp2(float(e) - 7.0f) * (1.0f + m / 8.0f);
+                        }
+                    }
+                    
+                    w_val *= scale_val;
+                    float x_val = (float)x_token[col];
+                    
+                    sum += w_val * x_val;
+                }
+                
+                threadgroup float shared_sum[1024];
+                shared_sum[ti_idx] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                
+                for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+                    if (ti_idx < stride) {
+                        shared_sum[ti_idx] += shared_sum[ti_idx + stride];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                
+                if (ti_idx == 0) {
+                    out[token_idx * OUT_DIM + row] = (bfloat)shared_sum[0];
+                }
+            }
+        """
+        return { (rowsPerTg: Int) in
+            let actualSource = """
+            #define IN_DIM \(self.inputDims)
+            #define OUT_DIM \(self.outputDims)
+            #define NUM_EXPERTS \(self.numExperts)
+            #define BS 128
+            #define ROWS_PER_TG \(rowsPerTg)
+            
+            \(metalSource)
+            """
+            return MLXFast.metalKernel(
+                name: "fp8_gather_gemv",
+                inputNames: ["x", "w", "scales", "indices"],
+                outputNames: ["out"],
+                source: actualSource
+            )
+        }
+    }()
     public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
-        let weightT = self.weight.swappedAxes(-1, -2)
-        var result = MLX.gatherMM(x, weightT, rhsIndices: indices, sortedIndices: sortedIndices)
+        let w = self.weight
+        var result: MLXArray
+        
+        if let inv = self.weightScaleInv, inv.size > 0 {
+            var numTokens = x.size / inputDims
+            if numTokens == 0 {
+                var outShape = x.shape
+                outShape[outShape.count - 1] = outputDims
+                return MLXArray.zeros(outShape).asType(x.dtype)
+            }
+            
+            var x = x
+            let expectedXShape = Array(indices.shape) + [inputDims]
+            
+            // If x doesn't match the expected broadcasting shape for indices, broadcast it
+            // gatherMM natively broadcasts, but our fp8GatherGemvKernel does not.
+            if x.shape != expectedXShape && x.size < indices.size * inputDims {
+                var xToBroadcast = x
+                if x.ndim == 5 {
+                    // x is [B, S, 1, 1, D], we need [B, S, 1, D] to broadcast to [B, S, topK, D]
+                    xToBroadcast = x.reshaped([x.dim(0), x.dim(1), 1, inputDims])
+                }
+                x = MLX.broadcast(xToBroadcast, to: expectedXShape)
+            }
+            
+            numTokens = x.size / inputDims
+            
+            let xFlat = x.reshaped([numTokens, inputDims]).contiguous()
+            let indicesFlat = indices.reshaped([numTokens]).contiguous()
+            
+            let outShape = [numTokens, outputDims]
+            let safeInv = inv.asType(.bfloat16).contiguous()
+            let wContig = w.contiguous()
+            
+            let isBatch = numTokens >= 64
+            let rowsPerTg = isBatch ? 16 : 1
+            let outDimGrid = (outputDims + rowsPerTg - 1) / rowsPerTg
+            
+            result = fp8GatherGemvKernel(rowsPerTg)(
+                [xFlat, wContig, safeInv, indicesFlat],
+                grid: (outDimGrid * 256, numTokens, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [outShape],
+                outputDTypes: [x.dtype]
+            )[0]
+            result = result.reshaped(Array(x.shape.dropLast()) + [outputDims])
+        } else {
+            let weightT = w.swappedAxes(-1, -2)
+            result = MLX.gatherMM(x, weightT, rhsIndices: indices, sortedIndices: sortedIndices)
+        }
 
         if let bias = self.bias {
             result = result + MLX.expandedDimensions(bias[indices], axis: -2)
         }
 
         return result
+    }
+
+    // MARK: - Cross-projection batching helpers (SSD streaming)
+
+    /// Allocate zero-filled weight buffers for `count` experts (lazy, not yet eval'd).
+    public func allocateExpertBuffers(_ count: Int) -> [MLXArray] {
+        var buffers = [MLXArray]()
+        for _ in 0..<count {
+            buffers.append(MLXArray.zeros([1, self.outputDims, self.inputDims]).asType(self.weight.dtype))
+        }
+        return buffers
+    }
+
+    public func computeExperts(_ x: MLXArray, buffers: [MLXArray], ranges: [ExpertRange]) -> MLXArray {
+        var expertResults = [MLXArray]()
+        for (i, r) in ranges.enumerated() {
+            let rangeX = x[r.start ..< r.end]
+            let expertIndices = MLXArray.zeros([rangeX.dim(0)], type: UInt32.self)
+            
+            var w = buffers[i]
+            // DUMMY DEPENDENCY: Prevent MLX from caching fromFp8.
+            // Since `buffers[i]` is mutated via C++ memcpy (preadInto), MLX doesn't know it changed.
+            // We use a random value that evaluates to 0 (uint8) to force a new graph node.
+            let dummy = MLXRandom.uniform(low: 0.0, high: 0.1).asType(.uint8)
+            w = w + dummy
+
+            if let inv = self.weightScaleInv, inv.size > 0 {
+                // Swift MLX safetensors loader maps F8_E4M3 → uint8 (raw bit patterns).
+                // We must call MLXFast.fromFp8 explicitly to get the same signed float values.
+                let wFp = MLXFast.fromFp8(w, dtype: .bfloat16)
+                // w is [1, outDim, inDim] (one expert loaded from SSD)
+                let bs = 128
+                let (m, n) = (wFp.dim(1), wFp.dim(2))
+                let outBlocks = (m + bs - 1) / bs
+                let inBlocks  = (n + bs - 1) / bs
+                let padBottom = (bs - m % bs) % bs
+                let padSide   = (bs - n % bs) % bs
+                if i == 0 {
+
+                }
+                var padded = MLX.padded(wFp, widths: [IntOrPair((0, 0)), IntOrPair((0, padBottom)), IntOrPair((0, padSide))])
+                if i == 0 {
+
+                }
+                padded = padded.reshaped([1, outBlocks, bs, inBlocks, bs])
+
+                // inv may be:
+                //  - 3D stacked: [numExperts, outBlocks, inBlocks]  (memory-resident path)
+                //  - 2D per-expert: [outBlocks, inBlocks]           (if loaded directly)
+                let invSlice: MLXArray
+                if inv.ndim == 3 {
+                    // Stacked: pick this expert's row and unsqueeze batch dim
+                    invSlice = inv[r.id ..< r.id + 1]  // [1, outBlocks, inBlocks]
+                    if i == 0 {
+
+                    }
+                } else {
+                    // Already 2D — unsqueeze for batch broadcast
+                    invSlice = MLX.expandedDimensions(inv, axis: 0)  // [1, outBlocks, inBlocks]
+                    if i == 0 {
+
+                    }
+                }
+
+                let scaled = padded * invSlice[0..., 0..., .newAxis, 0..., .newAxis]
+                let dequantized = scaled.reshaped([1, m + padBottom, n + padSide])[0..., 0 ..< m, 0 ..< n]
+                w = dequantized.asType(x.dtype)
+            } else {
+                if i == 0 { print("[SwitchLayers] computeExperts: NO weightScaleInv found! w shape=\(w.shape), dtype=\(w.dtype)") }
+            }
+
+            var expertOutput = MLX.gatherMM(
+                rangeX, w.swappedAxes(-1, -2),
+                rhsIndices: expertIndices,
+                sortedIndices: true
+            )
+            if let bias = self.bias {
+                let biasSlice = bias[r.id ..< r.id + 1]
+                expertOutput = expertOutput + MLX.expandedDimensions(biasSlice[expertIndices], axis: -2)
+            }
+            let leadingShape = Array(rangeX.shape.dropLast())
+            let canonicalShape = leadingShape + [self.outputDims]
+            if expertOutput.shape != canonicalShape {
+                expertOutput = expertOutput.reshaped(canonicalShape)
+            }
+            expertResults.append(expertOutput)
+        }
+        return MLX.concatenated(expertResults, axis: 0)
+    }
+
+    public func computeExpertsFused(
+        _ x: MLXArray, stackedBuffer: MLXArray, slotPerToken: MLXArray, slotExperts: [Int32]
+    ) -> MLXArray {
+        // Fallback for unquantized/FP8 - emulate the fused gather by evaluating active slots sequentially
+        let slots = slotPerToken.asArray(Int32.self)
+        if slots.isEmpty {
+            return MLXArray.zeros(x.shape).asType(x.dtype)
+        }
+        
+        var currentSlot = slots.first ?? 0
+        var currentStart = 0
+        var ranges = [(slot: Int32, start: Int, end: Int)]()
+        for (i, slot) in slots.enumerated() {
+            if slot != currentSlot {
+                ranges.append((slot: currentSlot, start: currentStart, end: i))
+                currentSlot = slot
+                currentStart = i
+            }
+        }
+        ranges.append((slot: currentSlot, start: currentStart, end: slots.count))
+
+        var expertResults = [MLXArray]()
+        for r in ranges {
+            let expertId = Int(slotExperts[Int(r.slot)])
+            let rangeX = x[r.start ..< r.end]
+            let expertIndices = MLXArray.zeros([rangeX.dim(0)], type: UInt32.self)
+            
+            var w = stackedBuffer[Int(r.slot)][.newAxis, 0..., 0...] // [1, outDim, inDim]
+            
+            // CACHE BREAKER: Invalidate MLX graph cache for this buffer slot.
+            // Since we mutate the underlying memory via pread (C++), we must change the ID.
+            let dummy = MLXRandom.uniform(low: 0.0, high: 0.001)
+            w = MLX.depends(input: w, dependencies: [dummy])
+            
+            if let inv = self.weightScaleInv, inv.size > 0 {
+                let wFp = MLXFast.fromFp8(w, dtype: .bfloat16)
+                
+                MLX.eval(wFp)
+                
+                let bs = 128
+                let (m, n) = (wFp.dim(1), wFp.dim(2))
+                let padBottom = (bs - m % bs) % bs
+                let padSide   = (bs - n % bs) % bs
+                var padded = MLX.padded(wFp, widths: [IntOrPair((0, 0)), IntOrPair((0, padBottom)), IntOrPair((0, padSide))])
+                padded = padded.reshaped([wFp.dim(0), (m + padBottom) / bs, bs, (n + padSide) / bs, bs])
+                let invSlice = inv[expertId ..< expertId + 1]
+                let scaled = padded * invSlice[0..., 0..., .newAxis, 0..., .newAxis]
+                let dequantized = scaled.reshaped([wFp.dim(0), m + padBottom, n + padSide])[0..., 0 ..< m, 0 ..< n]
+                w = dequantized.asType(x.dtype)
+            } else {
+                print("[SwitchLayers] computeExpertsFused: FATAL ERROR: NO weightScaleInv found! w shape=\(w.shape), dtype=\(w.dtype)")
+                fflush(stdout)
+            }
+            
+            var expertOutput = MLX.gatherMM(
+                rangeX, w.swappedAxes(-1, -2),
+                rhsIndices: expertIndices,
+                sortedIndices: true
+            )
+            
+            if let bias = self.bias {
+                let biasSlice = bias[expertId ..< expertId + 1]
+                expertOutput = expertOutput + MLX.expandedDimensions(biasSlice[expertIndices], axis: -2)
+            }
+            
+            let leadingShape = Array(rangeX.shape.dropLast())
+            let canonicalShape = leadingShape + [self.outputDims]
+            if expertOutput.shape != canonicalShape {
+                expertOutput = expertOutput.reshaped(canonicalShape)
+            }
+            expertResults.append(expertOutput)
+        }
+        
+        return MLX.concatenated(expertResults, axis: 0)
     }
 
     public func toQuantized(groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode) -> Module {
@@ -967,8 +1356,6 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
-    public var tensorName: String?
-
     public init(
         _ other: SwitchLinear, groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode = .affine
     ) {
@@ -1039,11 +1426,12 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
 
                 // ---- Sequential pread into each fresh buffer ----
                 for (i, r) in ranges.enumerated() {
+                    let ssd = self.resolveSSDInfo(expertIndex: r.id) ?? (info.path, info.tensorName, UInt32(r.id))
                     MLXFast.preadInto(
                         buffers[i],
-                        safetensorsPath: info.path,
-                        tensorName: info.tensorName,
-                        expertIndex: UInt32(r.id)
+                        safetensorsPath: ssd.path,
+                        tensorName: ssd.tensorName,
+                        expertIndex: ssd.readIndex
                     )
                 }
 
@@ -1149,24 +1537,8 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     }
 
 
-    // MARK: - Cross-projection batching helpers (SSD streaming)
-
-    /// Resolve the safetensors path and tensor name for SSD streaming.
-    public func resolveSSDInfo() -> (path: String, tensorName: String)? {
-        #if os(macOS)
-        guard ExpertStreamingConfig.shared.useDirectNVMe,
-              let tName = self.tensorName,
-              let filename = ExpertStreamerManager.shared?.getFile(for: tName),
-              let dir = ExpertStreamingConfig.shared.modelDirectory else { return nil }
-        let path = dir.appendingPathComponent(filename).path
-        return (path, tName)
-        #else
-        return nil
-        #endif
-    }
-
     /// Allocate zero-filled weight buffers for `count` experts (lazy, not yet eval'd).
-    public func allocateExpertBuffers(_ count: Int) -> [MLXArray] {
+    override public func allocateExpertBuffers(_ count: Int) -> [MLXArray] {
         var buffers = [MLXArray]()
         for _ in 0..<count {
             buffers.append(MLXArray.zeros([1, self.weight.dim(1), self.weight.dim(2)]).asType(self.weight.dtype))
@@ -1177,17 +1549,18 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     /// Load expert weights from SSD into pre-allocated (eval'd) buffers.
     public func loadExpertWeights(_ buffers: [MLXArray], ranges: [ExpertRange], ssdInfo: (path: String, tensorName: String)) {
         for (i, r) in ranges.enumerated() {
+            let ssd = self.resolveSSDInfo(expertIndex: r.id) ?? (ssdInfo.path, ssdInfo.tensorName, UInt32(r.id))
             MLXFast.preadInto(
                 buffers[i],
-                safetensorsPath: ssdInfo.path,
-                tensorName: ssdInfo.tensorName,
-                expertIndex: UInt32(r.id)
+                safetensorsPath: ssd.path,
+                tensorName: ssd.tensorName,
+                expertIndex: ssd.readIndex
             )
         }
     }
 
     /// Compute expert outputs using pre-loaded weight buffers. Returns LAZY result (no eval).
-    public func computeExperts(_ x: MLXArray, buffers: [MLXArray], ranges: [ExpertRange]) -> MLXArray {
+    override public func computeExperts(_ x: MLXArray, buffers: [MLXArray], ranges: [ExpertRange]) -> MLXArray {
         var expertResults = [MLXArray]()
         for (i, r) in ranges.enumerated() {
             let rangeX = x[r.start ..< r.end]
@@ -1234,7 +1607,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     ///       to a slot index in `stackedBuffer`. Built from the routing.
     ///   - slotExperts: per-slot expert IDs (`0..<numExperts`). Used to gather
     ///       per-slot scales/biases from `self.scales` and `self.biases`.
-    public func computeExpertsFused(
+    override public func computeExpertsFused(
         _ x: MLXArray,
         stackedBuffer: MLXArray,
         slotPerToken: MLXArray,

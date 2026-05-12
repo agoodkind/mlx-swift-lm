@@ -786,6 +786,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     var tokenCount = 0
     let maxTokens: Int?
     let numDraftTokens: Int
+    let parameters: GenerateParameters
 
     // Buffer of accepted tokens from the current speculation round
     private var pendingTokens = [Int]()
@@ -829,6 +830,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
         self.maxTokens = parameters.maxTokens
         self.numDraftTokens = numDraftTokens
+        self.parameters = parameters
 
         self.quantizeKVCache = { cache in
             maybeQuantizeKVCache(
@@ -890,10 +892,12 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         // Draft generation: autoregressive loop with draft model
         var draftProcessor = processor  // Copy to discard later
         var draftTokens = [MLXArray]()
+        var draftProcessedLogits = [MLXArray]()
         for _ in 0 ..< numDraft {
             let draftResult = draftModel(draftY[text: .newAxis], cache: draftCache, state: nil)
             var draftLogits = draftResult.logits[0..., -1, 0...]
             draftLogits = draftProcessor?.process(logits: draftLogits) ?? draftLogits
+            draftProcessedLogits.append(draftLogits)
             let draftToken = sampler.sample(logits: draftLogits)
             draftProcessor?.didSample(token: draftToken)
             asyncEval(draftToken)
@@ -910,6 +914,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         mainState = mainResult.state
 
         let mainTokens: MLXArray
+        var mainProcessedLogits = [MLXArray]()
         if var verifyProcessor = processor {
             // Process each position sequentially so that the processor sees tokens sampled at earlier positions
             var sampled = [MLXArray]()
@@ -919,34 +924,91 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
                 let token = sampler.sample(logits: logits)
                 verifyProcessor.didSample(token: token)
                 sampled.append(token)
+                mainProcessedLogits.append(logits)
             }
             mainTokens = concatenated(sampled)
         } else {
             // Batch-sample all verify tokens from main model in one operation
             let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
             mainTokens = sampler.sample(logits: verifyLogits)
+            for i in 0 ..< (numDraft + 1) {
+                mainProcessedLogits.append(verifyLogits[i ..< i + 1])
+            }
         }
 
         // Compare and accept proposed tokens
-        eval(mainTokens, draftTokens)
         let mainTokensList = mainTokens.asArray(Int.self)
         let draftTokensList = concatenated(draftTokens).asArray(Int.self)
         var accepted = 0
-        for i in 0 ..< numDraft {
-            guard mainTokensList[i] == draftTokensList[i] else {
-                break
+        let temp = parameters.temperature
+        let finalTokenOut: MLXArray
+        
+        if temp == 0.0 {
+            // Greedy Decoding (Exact Match = Rejection Sampling at temp 0)
+            for i in 0 ..< numDraft {
+                guard mainTokensList[i] == draftTokensList[i] else {
+                    break
+                }
+                processor?.didSample(token: draftTokens[i])
+                pendingTokens.append(mainTokensList[i])
+                accepted += 1
             }
-
-            processor?.didSample(token: draftTokens[i])
-            pendingTokens.append(mainTokensList[i])
-            accepted += 1
+            finalTokenOut = mainTokens[accepted ... accepted]
+            processor?.didSample(token: finalTokenOut)
+            pendingTokens.append(mainTokensList[accepted])
+        } else {
+            // Probabilistic Speculative Rejection Sampling (Leviathan et al.)
+            var finalToken: MLXArray? = nil
+            for i in 0 ..< numDraft {
+                let x = draftTokensList[i]
+                
+                // Force evaluation of distributions for this step
+                let pTarget = MLX.softmax(mainProcessedLogits[i] / temp, axis: -1)
+                let pDraft = MLX.softmax(draftProcessedLogits[i] / temp, axis: -1)
+                eval(pTarget, pDraft)
+                
+                // Access scalar probability (assuming logits are [1, Vocab] or [Vocab])
+                let pTargetX: Float
+                let pDraftX: Float
+                if pTarget.ndim == 2 {
+                    pTargetX = pTarget[0, x].item(Float.self)
+                    pDraftX = pDraft[0, x].item(Float.self)
+                } else {
+                    pTargetX = pTarget[x].item(Float.self)
+                    pDraftX = pDraft[x].item(Float.self)
+                }
+                
+                let acceptProb = Swift.min(1.0, pTargetX / Swift.max(pDraftX, 1e-9))
+                let u = Float.random(in: 0..<1)
+                
+                if u < acceptProb {
+                    processor?.didSample(token: draftTokens[i])
+                    pendingTokens.append(x)
+                    accepted += 1
+                } else {
+                    // Rejected! Resample from the corrected distribution
+                    var pResample = MLX.maximum(pTarget - pDraft, MLXArray(0.0))
+                    let sum = pResample.sum().item(Float.self)
+                    if sum > 1e-6 {
+                        pResample = pResample / sum
+                        let resampleLogits = MLX.log(MLX.maximum(pResample, MLXArray(1e-9)))
+                        finalToken = MLXRandom.categorical(resampleLogits)
+                    } else {
+                        // Fallback
+                        finalToken = MLXArray(mainTokensList[i])
+                    }
+                    break
+                }
+            }
+            
+            if finalToken == nil {
+                // All drafts accepted!
+                finalToken = mainTokens[accepted ... accepted]
+            }
+            finalTokenOut = finalToken!
+            processor?.didSample(token: finalTokenOut)
+            pendingTokens.append(finalTokenOut.item(Int.self))
         }
-
-        // Always emit the main model's token at position `accepted`
-        // (either the correction token or the bonus token if all drafts matched)
-        let finalToken = mainTokens[accepted ... accepted]
-        processor?.didSample(token: finalToken)
-        pendingTokens.append(mainTokensList[accepted])
 
         // Rewind caches for rejected tokens
         trimPromptCache(mainCache, numTokens: numDraft - accepted)
@@ -957,8 +1019,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         quantizeKVCache(&draftCache)
 
         // Set y/draftY for the next round
-        y = .init(tokens: finalToken)
-        draftY = .init(tokens: finalToken)
+        y = .init(tokens: finalTokenOut)
+        draftY = .init(tokens: finalTokenOut)
 
         // If all draft tokens were accepted, the draft model hasn't processed
         // the last accepted draft token yet. Feed it through to keep caches in sync.
@@ -966,10 +1028,333 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             draftY = .init(
                 tokens: concatenated([
                     draftTokens[numDraft - 1].reshaped([1]),
-                    finalToken,
+                    finalTokenOut,
                 ])
             )
         }
+    }
+
+    mutating public func next() -> Int? {
+        if let maxTokens, tokenCount >= maxTokens {
+            return nil
+        }
+
+        // Drain the pending buffer first
+        if pendingIndex < pendingTokens.count {
+            let token = pendingTokens[pendingIndex]
+            pendingIndex += 1
+            tokenCount += 1
+            return token
+        }
+
+        // Run a new speculation round
+        pendingTokens.removeAll(keepingCapacity: true)
+        pendingIndex = 0
+        speculateRound()
+
+        if pendingTokens.isEmpty {
+            return nil
+        }
+
+        let token = pendingTokens[pendingIndex]
+        pendingIndex += 1
+        tokenCount += 1
+        return token
+    }
+}
+
+/// An iterator that generates tokens using Multi-Token Prediction (MTP) for speculative decoding.
+/// It uses internal MTP heads of the main model instead of an external draft model.
+public struct MTPTokenIterator: TokenIteratorProtocol {
+
+    var y: LMInput.Text
+    let model: any MTPLanguageModel
+
+    var state: LMOutput.State?
+    public let streamingError: SSDStreamingError? = nil
+    var cache: [KVCache]
+    var mtpCaches: [[KVCache]]
+    let quantizeKVCache: (inout [KVCache]) -> Void
+
+    var processor: LogitProcessor?
+    let sampler: LogitSampler
+    let parameters: GenerateParameters
+
+    var tokenCount = 0
+    let maxTokens: Int?
+
+    // Number of tokens the MTP heads predict (k)
+    let numMTPTokens: Int
+
+    // Logits from the previous step's MTP heads
+    var mtpLogits: [MLXArray]?
+
+    // Buffer of accepted tokens from the current speculation round
+    private var pendingTokens = [Int]()
+    private var pendingIndex = 0
+
+    // Internal metrics
+    public var acceptedDraftTokens: Int = 0
+    public var totalDraftTokens: Int = 0
+    var promptPrefillTime: TimeInterval = 0.0
+
+    /// Initialize a `MTPTokenIterator` with the given input.
+    public init(
+        input: LMInput,
+        model: any MTPLanguageModel,
+        cache: [KVCache]? = nil,
+        parameters: GenerateParameters,
+        numMTPTokens: Int = 1
+    ) throws {
+        self.y = input.text
+        self.model = model
+        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.mtpCaches = model.makeMTPCaches(parameters: parameters)
+        
+        guard canTrimPromptCache(self.cache) else {
+            throw KVCacheError(message: "MTP Speculative decoding requires trimmable KV caches.")
+        }
+
+        self.sampler = parameters.sampler()
+        self.processor = parameters.processor()
+        self.parameters = parameters
+
+        self.maxTokens = parameters.maxTokens
+        self.numMTPTokens = numMTPTokens
+
+        self.quantizeKVCache = { cache in
+            maybeQuantizeKVCache(
+                cache: &cache,
+                kvBits: parameters.kvBits,
+                kvGroupSize: parameters.kvGroupSize,
+                quantizedKVStart: parameters.quantizedKVStart
+            )
+        }
+
+        self.promptPrefillTime = try measure {
+            try prepare(input: input, windowSize: parameters.prefillStepSize)
+        }
+    }
+
+    /// Prefill the main model with the prompt, priming caches for generation
+    mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        processor?.prompt(input.text.tokens)
+
+        // Prefill main model
+        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+        case .tokens(let tokens):
+            y = tokens
+        case .logits(let result):
+            var logits = result.logits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
+            let token = sampler.sample(logits: logits)
+            processor?.didSample(token: token)
+            y = .init(tokens: token)
+            state = result.state
+        }
+    }
+
+    /// Run one round of MTP speculative decoding: draft from MTP heads, verify via main, accept/reject
+    mutating func speculateRound() {
+        let remaining = maxTokens.map { $0 - tokenCount } ?? numMTPTokens
+        let numDraft = Swift.min(remaining, numMTPTokens)
+        guard numDraft > 0 else {
+            return
+        }
+
+        // Draft generation: Use MTP logits from the previous step
+        var draftTokens = [MLXArray]()
+        var draftProcessedLogits = [MLXArray]()
+        if let previousMTP = mtpLogits, !previousMTP.isEmpty {
+            let countToSample = Swift.min(numDraft, previousMTP.count)
+            var draftProcessor = processor
+            for i in 0 ..< countToSample {
+                var draftLogit = previousMTP[i]
+                draftLogit = draftProcessor?.process(logits: draftLogit) ?? draftLogit
+                let draftToken = sampler.sample(logits: draftLogit)
+                draftProcessor?.didSample(token: draftToken)
+                draftTokens.append(draftToken)
+                draftProcessedLogits.append(draftLogit)
+            }
+        }
+
+        // If no draft tokens were generated (e.g. first step), fallback to regular generation
+        if draftTokens.isEmpty {
+            let mtpResult = model.callMTP(y.tokens[.newAxis], cache: cache, mtpCaches: mtpCaches)
+            guard !mtpResult.isEmpty else { return }
+
+            let mainLogits = mtpResult[0]
+            var logits = mainLogits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
+            let token = sampler.sample(logits: logits)
+            processor?.didSample(token: token)
+
+            pendingTokens.append(token.item(Int.self))
+            y = .init(tokens: token)
+
+            // Save future MTP logits for next iteration (slice to single position)
+            self.mtpLogits = mtpResult.count > 1 ? mtpResult.dropFirst().map { $0[0..., -1, 0...] } : nil
+
+            // Force evaluation of MTP state to prevent graph collapse
+            var evalArrays = [token]
+            if let mtpLogits = self.mtpLogits { evalArrays.append(contentsOf: mtpLogits) }
+            eval(evalArrays)
+
+            quantizeKVCache(&cache)
+            for i in mtpCaches.indices {
+                quantizeKVCache(&mtpCaches[i])
+            }
+            return
+        }
+
+        // Verification: main model processes proposals in one pass
+        for layer in cache {
+            if let mamba = layer as? MambaCache { mamba.checkpoint() }
+        }
+
+        let verifyTokens = [y.tokens] + draftTokens
+        let verifyInput = LMInput.Text(tokens: concatenated(verifyTokens))
+        let verifyStart = verifyInput.tokens.dim(0) - (draftTokens.count + 1)
+        
+        let mtpResult = model.callMTP(verifyInput.tokens[.newAxis], cache: cache, mtpCaches: mtpCaches)
+        guard !mtpResult.isEmpty else { return }
+        
+        let mainLogits = mtpResult[0]
+
+        let mainTokens: MLXArray
+        var mainProcessedLogits = [MLXArray]()
+        if var verifyProcessor = processor {
+            // Process sequentially
+            var sampled = [MLXArray]()
+            for i in 0 ..< (draftTokens.count + 1) {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = verifyProcessor.process(logits: logits)
+                let token = sampler.sample(logits: logits)
+                verifyProcessor.didSample(token: token)
+                sampled.append(token)
+                mainProcessedLogits.append(logits)
+            }
+            mainTokens = concatenated(sampled)
+        } else {
+            // Batch sample
+            let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
+            mainTokens = sampler.sample(logits: verifyLogits)
+            for i in 0 ..< (draftTokens.count + 1) {
+                mainProcessedLogits.append(verifyLogits[i ..< i + 1])
+            }
+        }
+
+        // We defer eval() until after we compute mtpLogits to force the graph
+        let mainTokensList = mainTokens.asArray(Int.self)
+        let draftTokensList = concatenated(draftTokens).asArray(Int.self)
+        var accepted = 0
+        
+        let temp = parameters.temperature
+        let finalTokenOut: MLXArray
+        
+        if temp == 0.0 {
+            // Greedy Decoding (Exact Match = Rejection Sampling at temp 0)
+            for i in 0 ..< draftTokens.count {
+                guard mainTokensList[i] == draftTokensList[i] else {
+                    break
+                }
+                processor?.didSample(token: draftTokens[i])
+                pendingTokens.append(mainTokensList[i])
+                accepted += 1
+            }
+            finalTokenOut = mainTokens[accepted ... accepted]
+            processor?.didSample(token: finalTokenOut)
+            pendingTokens.append(mainTokensList[accepted])
+        } else {
+            // Probabilistic Speculative Rejection Sampling (Leviathan et al.)
+            var finalToken: MLXArray? = nil
+            for i in 0 ..< draftTokens.count {
+                let x = draftTokensList[i]
+                
+                // Force evaluation of distributions for this step
+                let pTarget = MLX.softmax(mainProcessedLogits[i] / temp, axis: -1)
+                let pDraft = MLX.softmax(draftProcessedLogits[i] / temp, axis: -1)
+                eval(pTarget, pDraft)
+                
+                // Access scalar probability (assuming logits are [1, Vocab] or [Vocab])
+                let pTargetX: Float
+                let pDraftX: Float
+                if pTarget.ndim == 2 {
+                    pTargetX = pTarget[0, x].item(Float.self)
+                    pDraftX = pDraft[0, x].item(Float.self)
+                } else {
+                    pTargetX = pTarget[x].item(Float.self)
+                    pDraftX = pDraft[x].item(Float.self)
+                }
+                
+                let acceptProb = Swift.min(1.0, pTargetX / Swift.max(pDraftX, 1e-9))
+                let u = Float.random(in: 0..<1)
+                
+                if u < acceptProb {
+                    processor?.didSample(token: draftTokens[i])
+                    pendingTokens.append(x)
+                    accepted += 1
+                } else {
+                    // Rejected! Resample from the corrected distribution
+                    var pResample = MLX.maximum(pTarget - pDraft, MLXArray(0.0))
+                    let sum = pResample.sum().item(Float.self)
+                    if sum > 1e-6 {
+                        pResample = pResample / sum
+                        // categorical takes raw logits, so we convert back
+                        let resampleLogits = MLX.log(MLX.maximum(pResample, MLXArray(1e-9)))
+                        finalToken = MLXRandom.categorical(resampleLogits)
+                    } else {
+                        // Fallback
+                        finalToken = MLXArray(mainTokensList[i])
+                    }
+                    break
+                }
+            }
+            
+            if finalToken == nil {
+                // All drafts accepted!
+                finalToken = mainTokens[accepted ... accepted]
+            }
+            finalTokenOut = finalToken!
+            processor?.didSample(token: finalTokenOut)
+            pendingTokens.append(finalTokenOut.item(Int.self))
+        }
+        self.acceptedDraftTokens += accepted
+        self.totalDraftTokens += draftTokens.count
+
+        // Rewind caches for rejected tokens
+        let rejectedCount = draftTokens.count - accepted
+        trimPromptCache(cache, numTokens: rejectedCount)
+        for mtpCache in mtpCaches {
+            trimPromptCache(mtpCache, numTokens: rejectedCount)
+        }
+
+        // Apply dynamic cache quantization after rewind
+        quantizeKVCache(&cache)
+        for i in mtpCaches.indices {
+            quantizeKVCache(&mtpCaches[i])
+        }
+
+        // Set y for the next round
+        y = .init(tokens: finalTokenOut)
+
+        // Update mtpLogits from the verification pass for the NEXT speculation round.
+        // mtpResult[1..N] contains the MTP head outputs for each depth.
+        // Each head output is [B, 1, vocab] — extract directly (no position indexing needed).
+        // Only keep them if ALL drafts were accepted, otherwise they are invalid due to cache rewind.
+        if accepted == draftTokens.count && mtpResult.count > 1 {
+            self.mtpLogits = mtpResult.dropFirst().map { headLogits in
+                // headLogits shape: [B, 1, vocab] — squeeze to [B, vocab] for the sampler
+                headLogits[0..., headLogits.dim(1) - 1, 0...]
+            }
+        } else {
+            self.mtpLogits = nil
+        }
+
+        // Force evaluation of MTP state to prevent graph collapse
+        var evalArrays = [mainTokens] + draftTokens
+        if let mtpLogits = self.mtpLogits { evalArrays.append(contentsOf: mtpLogits) }
+        eval(evalArrays)
     }
 
     mutating public func next() -> Int? {
@@ -1467,14 +1852,76 @@ public func generate(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
-    let iterator = try SpeculativeTokenIterator(
+
+    let iterator: any TokenIteratorProtocol
+    if let mtpModel = draftModel as? DualModelMTP {
+        // Set up the dual-model MTP reference
+        mtpModel.mainModelRef = context.model as? any BaseLanguageModel
+        iterator = try MTPTokenIterator(
+            input: input,
+            model: mtpModel,
+            cache: cache,
+            parameters: parameters,
+            numMTPTokens: numDraftTokens
+        )
+    } else {
+        iterator = try SpeculativeTokenIterator(
+            input: input,
+            mainModel: context.model,
+            draftModel: draftModel,
+            mainCache: cache,
+            draftCache: draftCache,
+            parameters: parameters,
+            numDraftTokens: numDraftTokens
+        )
+    }
+    let (stream, _) = generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: context.tokenizer,
+            format: context.configuration.toolCallFormat ?? .json
+        )
+    )
+    return stream
+}
+
+/// Generates text asynchronously using MTP (Multi-Token Prediction) internal speculative decoding.
+///
+/// Uses the model's built-in MTP heads to draft `numMTPTokens` candidate tokens per round and
+/// verify them in one batched forward pass — targeting 2x+ throughput with no extra VRAM.
+///
+/// - Parameters:
+///   - input: The input for the language model.
+///   - cache: optional ``KVCache``
+///   - parameters: The configuration options for token generation.
+///   - context: The model context (model must conform to ``MTPLanguageModel``).
+///   - numMTPTokens: Number of tokens the MTP heads draft per speculation round (default: 1).
+///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
+/// - Returns: An `AsyncStream` that emits `Generation` values.
+/// - Throws: An error if the iterator initialization fails.
+public func generateMTP(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    numMTPTokens: Int = 1,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> AsyncStream<Generation> {
+    guard let mtpModel = context.model as? (any MTPLanguageModel) else {
+        // Graceful fallback: model doesn't support MTP — use standard iterator
+        return try generate(input: input, cache: cache, parameters: parameters, context: context,
+                            wiredMemoryTicket: wiredMemoryTicket)
+    }
+    let iterator = try MTPTokenIterator(
         input: input,
-        mainModel: context.model,
-        draftModel: draftModel,
-        mainCache: cache,
-        draftCache: draftCache,
+        model: mtpModel,
+        cache: cache,
         parameters: parameters,
-        numDraftTokens: numDraftTokens
+        numMTPTokens: numMTPTokens
     )
     let (stream, _) = generateLoopTask(
         promptTokenCount: input.text.tokens.size,

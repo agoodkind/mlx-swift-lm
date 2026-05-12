@@ -251,6 +251,182 @@ extension MLXTestingSuite {
         #expect(!sum.isNaN)
         #expect(!sum.isInfinite)
     }
+
+    // -------------------------------------------------------------------------
+    // MARK: - MTP Speculative Decoding Tests
+    //
+    // Exercises the full Gemma4 two-stage MTP pipeline:
+    //   1. Gemma4AssistantModel.callMTP() wired with mainModelRef
+    //   2. MTPTokenIterator fallback path (first step, no prior mtpLogits)
+    //   3. MTPTokenIterator draft+verify round
+    //   4. Greedy determinism and NaN-free output
+    //
+    // No real weights needed — tiny random-init models validate shape/flow.
+    // Design reference: llama.cpp PR #22673 (Qwen3.6 MTP, 72% accept rate)
+    // Key insight from llama.cpp: hidden state BEFORE final norm (t_h_pre_norm)
+    // must be passed to the MTP head, not the post-norm output.
+    // -------------------------------------------------------------------------
+
+    private func makeTinyAssistantConfigData() -> Data {
+        // Same dims as makeTinyConfigData() so no projection weight is needed
+        let json = """
+        {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "head_dim": 16,
+                "global_head_dim": 64,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 100,
+                "num_key_value_heads": 2,
+                "rope_traditional": false,
+                "sliding_window": 128,
+                "sliding_window_pattern": 1,
+                "max_position_embeddings": 512,
+                "num_kv_shared_layers": 0,
+                "use_double_wide_mlp": false,
+                "tie_word_embeddings": true,
+                "hidden_size_per_layer_input": 0,
+                "vocab_size_per_layer_input": 100,
+                "final_logit_softcapping": 30.0,
+                "enable_moe_block": false,
+                "attention_k_eq_v": false
+            },
+            "vocab_size": 100
+        }
+        """
+        return json.data(using: .utf8)!
+    }
+
+    @Test("Gemma4 MTP — callMTP returns main logits with correct shape")
+    func testGemma4AssistantCallMTPShape() throws {
+        let mainCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyConfigData())
+        let asstCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyAssistantConfigData())
+        let mainModel = Gemma4Model(mainCfg)
+        let asstModel = Gemma4AssistantModel(asstCfg)
+        asstModel.mainModelRef = mainModel
+
+        let cache = asstModel.newCache(parameters: nil)
+        let input = MLXArray(0..<5).reshaped(1, 5)
+        let results = asstModel.callMTP(input, cache: cache, mtpCaches: nil)
+
+        #expect(results.count >= 1)
+        let mainLogits = results[0]
+        #expect(mainLogits.shape == [1, 5, 100])
+        let sum = mainLogits.sum().item(Float.self)
+        #expect(!sum.isNaN)
+        #expect(!sum.isInfinite)
+    }
+
+    @Test("Gemma4 MTP — assistant logits have correct vocab dimension")
+    func testGemma4AssistantMTPVocabDim() throws {
+        let mainCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyConfigData())
+        let asstCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyAssistantConfigData())
+        let mainModel = Gemma4Model(mainCfg)
+        let asstModel = Gemma4AssistantModel(asstCfg)
+        asstModel.mainModelRef = mainModel
+
+        let cache = asstModel.newCache(parameters: nil)
+        let input = MLXArray(0..<3).reshaped(1, 3)
+        let results = asstModel.callMTP(input, cache: cache, mtpCaches: nil)
+
+        for logits in results {
+            #expect(logits.dim(-1) == 100)
+        }
+    }
+
+    @Test("Gemma4 MTP — MTPTokenIterator fallback produces a valid token")
+    func testMTPTokenIteratorFallbackStep() throws {
+        let mainCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyConfigData())
+        let asstCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyAssistantConfigData())
+        let mainModel = Gemma4Model(mainCfg)
+        let asstModel = Gemma4AssistantModel(asstCfg)
+        asstModel.mainModelRef = mainModel
+
+        let params = GenerateParameters(maxTokens: 3, temperature: 0.0)
+        let input = LMInput(tokens: MLXArray([1, 2, 3, 4, 5]))
+
+        var iterator = try MTPTokenIterator(
+            input: input, model: asstModel, parameters: params, numMTPTokens: 1)
+
+        let token = iterator.next()
+        #expect(token != nil)
+        if let t = token {
+            #expect(t >= 0 && t < 100)
+        }
+    }
+
+    @Test("Gemma4 MTP — iterator generates exactly maxTokens then stops")
+    func testMTPTokenIteratorMaxTokens() throws {
+        let mainCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyConfigData())
+        let asstCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyAssistantConfigData())
+        let mainModel = Gemma4Model(mainCfg)
+        let asstModel = Gemma4AssistantModel(asstCfg)
+        asstModel.mainModelRef = mainModel
+
+        let params = GenerateParameters(maxTokens: 4, temperature: 0.0)
+        let input = LMInput(tokens: MLXArray([1, 2, 3]))
+
+        var iterator = try MTPTokenIterator(
+            input: input, model: asstModel, parameters: params, numMTPTokens: 1)
+
+        var tokens = [Int]()
+        while let t = iterator.next() { tokens.append(t) }
+
+        #expect(tokens.count == 4)
+        for t in tokens { #expect(t >= 0 && t < 100) }
+    }
+
+    @Test("Gemma4 MTP — greedy decoding is deterministic")
+    func testMTPTokenIteratorDeterminism() throws {
+        let mainCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyConfigData())
+        let asstCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyAssistantConfigData())
+        let mainModel = Gemma4Model(mainCfg)
+
+        let params = GenerateParameters(maxTokens: 5, temperature: 0.0)
+        let input = LMInput(tokens: MLXArray([7, 3, 1]))
+
+        func run() throws -> [Int] {
+            let asst = Gemma4AssistantModel(asstCfg)
+            asst.mainModelRef = mainModel
+            var it = try MTPTokenIterator(
+                input: input, model: asst, parameters: params, numMTPTokens: 1)
+            var out = [Int]()
+            while let t = it.next() { out.append(t) }
+            return out
+        }
+
+        let run1 = try run()
+        let run2 = try run()
+        #expect(run1 == run2)
+    }
+
+    @Test("Gemma4 MTP — no NaN/Inf in generated token stream")
+    func testMTPTokenIteratorNoNaNInf() throws {
+        let mainCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyConfigData())
+        let asstCfg = try JSONDecoder().decode(Gemma4Configuration.self, from: makeTinyAssistantConfigData())
+        let mainModel = Gemma4Model(mainCfg)
+        let asstModel = Gemma4AssistantModel(asstCfg)
+        asstModel.mainModelRef = mainModel
+
+        let params = GenerateParameters(maxTokens: 8, temperature: 0.0)
+        let input = LMInput(tokens: MLXArray([1, 5, 9, 2]))
+
+        var iterator = try MTPTokenIterator(
+            input: input, model: asstModel, parameters: params, numMTPTokens: 1)
+
+        var count = 0
+        while let t = iterator.next() {
+            #expect(t >= 0 && t < 100)
+            count += 1
+        }
+        #expect(count == 8)
+    }
+    }
 }
-}
+
 

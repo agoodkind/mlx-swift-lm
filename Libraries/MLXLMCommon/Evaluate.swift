@@ -1094,6 +1094,8 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
     private var pendingIndex = 0
 
     // Internal metrics
+    public var acceptedDraftTokens: Int = 0
+    public var totalDraftTokens: Int = 0
     var promptPrefillTime: TimeInterval = 0.0
 
     /// Initialize a `MTPTokenIterator` with the given input.
@@ -1317,10 +1319,8 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: finalTokenOut)
             pendingTokens.append(finalTokenOut.item(Int.self))
         }
-        
-        if draftTokens.count > 0 {
-            print("      [MTP Debug] Drafts: \(draftTokensList), Target: \(mainTokensList), Accepted: \(accepted)")
-        }
+        self.acceptedDraftTokens += accepted
+        self.totalDraftTokens += draftTokens.count
 
         // Rewind caches for rejected tokens
         let rejectedCount = draftTokens.count - accepted

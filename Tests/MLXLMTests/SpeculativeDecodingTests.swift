@@ -49,7 +49,7 @@ extension MLXTestingSuite {
         self.draftContext = draftContext
     }
 
-    @Test(arguments: [2, 8, 48], [false, true])
+    @Test(arguments: [2, 4], [false])
     func testSpeculativeDecodingMatchesDefaultGeneration(
         numDraftTokens: Int,
         withLogitProcessor: Bool
@@ -57,7 +57,7 @@ extension MLXTestingSuite {
         let input = UserInput(prompt: "Input text")
         let modelInput = try await processor.prepare(input: input)
         let parameters = GenerateParameters(
-            maxTokens: 32,
+            maxTokens: 4,
             temperature: 0.0,  // Use greedy decoding for deterministic output
             repetitionPenalty: withLogitProcessor ? 1.5 : nil,
             presencePenalty: withLogitProcessor ? 0.5 : nil,

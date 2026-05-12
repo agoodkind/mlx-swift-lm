@@ -19,12 +19,16 @@ public struct Gemma4Configuration: Codable, Sendable {
     var textConfig: Gemma4TextConfiguration
     var vocabSize: Int = 262144
     var backboneHiddenSize: Int?
+    var numCentroids: Int?
+    var centroidIntermediateTopK: Int?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case textConfig = "text_config"
         case vocabSize = "vocab_size"
         case backboneHiddenSize = "backbone_hidden_size"
+        case numCentroids = "num_centroids"
+        case centroidIntermediateTopK = "centroid_intermediate_top_k"
     }
 
     public init(from decoder: Decoder) throws {
@@ -32,6 +36,8 @@ public struct Gemma4Configuration: Codable, Sendable {
         self.modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4"
         self.vocabSize = try container.decodeIfPresent(Int.self, forKey: .vocabSize) ?? 262144
         self.backboneHiddenSize = try container.decodeIfPresent(Int.self, forKey: .backboneHiddenSize)
+        self.numCentroids = try container.decodeIfPresent(Int.self, forKey: .numCentroids)
+        self.centroidIntermediateTopK = try container.decodeIfPresent(Int.self, forKey: .centroidIntermediateTopK)
 
         // If text_config is present, decode from it; otherwise treat entire config as text config
         if let textConfig = try container.decodeIfPresent(

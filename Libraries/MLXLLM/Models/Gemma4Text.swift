@@ -1219,6 +1219,9 @@ public class Gemma4AssistantModel: Module, LLMModel, DualModelMTP, KVCacheDimens
                 hAssistant = matmul(hConcat, preProjWeight.T)  // [B, 1, 256]
             } else {
                 hAssistant = hConcat
+                if hAssistant.dim(-1) != config.hiddenSize {
+                    hAssistant = hAssistant[.ellipsis, ..<config.hiddenSize]
+                }
             }
 
             // Step C: Run all 4 assistant transformer layers
@@ -1275,6 +1278,15 @@ public class Gemma4AssistantModel: Module, LLMModel, DualModelMTP, KVCacheDimens
                 hLast = matmul(hNormed, postProjWeight.T)  // [B, 1, 1536]
             } else {
                 hLast = hNormed
+                if hLast.dim(-1) != backboneDim {
+                    // Pad or slice to match backbone dim for the next iteration's concat
+                    if hLast.dim(-1) > backboneDim {
+                        hLast = hLast[.ellipsis, ..<backboneDim]
+                    } else if hLast.dim(-1) < backboneDim {
+                        let pad = MLX.zeros([hLast.dim(0), hLast.dim(1), backboneDim - hLast.dim(-1)]).asType(hLast.dtype)
+                        hLast = concatenated([hLast, pad], axis: -1)
+                    }
+                }
             }
 
             // Step G: The next depth's token embedding is sampled from the logits we just produced.

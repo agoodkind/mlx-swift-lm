@@ -171,6 +171,9 @@ public class SwitchGLU: Module, @unchecked Sendable {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
         guard idx.size <= 32,
+              gateProj is QuantizedSwitchLinear,
+              upProj is QuantizedSwitchLinear,
+              downProj is QuantizedSwitchLinear,
               let gateSSD = gateProj.resolveSSDInfo(),
               let upSSD = upProj.resolveSSDInfo(),
               let downSSD = downProj.resolveSSDInfo() else {
@@ -1215,7 +1218,7 @@ public class SwitchLinear: Module, Quantizable {
                 if i == 0 {
 
                 }
-                var padded = MLX.padded(wFp, widths: [[0,0], [0, padBottom], [0, padSide]])
+                var padded = MLX.padded(wFp, widths: [IntOrPair((0, 0)), IntOrPair((0, padBottom)), IntOrPair((0, padSide))])
                 if i == 0 {
 
                 }
@@ -1308,7 +1311,7 @@ public class SwitchLinear: Module, Quantizable {
                 let (m, n) = (wFp.dim(1), wFp.dim(2))
                 let padBottom = (bs - m % bs) % bs
                 let padSide   = (bs - n % bs) % bs
-                var padded = MLX.padded(wFp, widths: [[0,0], [0, padBottom], [0, padSide]])
+                var padded = MLX.padded(wFp, widths: [IntOrPair((0, 0)), IntOrPair((0, padBottom)), IntOrPair((0, padSide))])
                 padded = padded.reshaped([wFp.dim(0), (m + padBottom) / bs, bs, (n + padSide) / bs, bs])
                 let invSlice = inv[expertId ..< expertId + 1]
                 let scaled = padded * invSlice[0..., 0..., .newAxis, 0..., .newAxis]

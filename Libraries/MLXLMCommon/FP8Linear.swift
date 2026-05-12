@@ -148,7 +148,7 @@ public class FP8Linear: Module, @unchecked Sendable {
             let padB = (blockSize - m % blockSize) % blockSize
             let padS = (blockSize - n % blockSize) % blockSize
             
-            var padded = MLX.padded(wFp, widths: [[0, padB], [0, padS]])
+            var padded = MLX.padded(wFp, widths: [IntOrPair((0, padB)), IntOrPair((0, padS))])
             padded = padded.reshaped([(m + padB) / blockSize, blockSize, (n + padS) / blockSize, blockSize])
             let scaled = padded * weightScaleInv[0..., .newAxis, 0..., .newAxis]
             let dequantized = scaled.reshaped([m + padB, n + padS])[0 ..< m, 0 ..< n]

@@ -1317,6 +1317,10 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: finalTokenOut)
             pendingTokens.append(finalTokenOut.item(Int.self))
         }
+        
+        if draftTokens.count > 0 {
+            print("      [MTP Debug] Drafts: \(draftTokensList), Target: \(mainTokensList), Accepted: \(accepted)")
+        }
 
         // Rewind caches for rejected tokens
         let rejectedCount = draftTokens.count - accepted
@@ -1334,10 +1338,14 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         // Set y for the next round
         y = .init(tokens: finalTokenOut)
 
-        // Save future MTP logits if available
-        if mtpResult.count > 1 {
-            self.mtpLogits = mtpResult.dropFirst().map { 
-                $0[0..., verifyStart + accepted, 0...] 
+        // Update mtpLogits from the verification pass for the NEXT speculation round.
+        // mtpResult[1..N] contains the MTP head outputs for each depth.
+        // Each head output is [B, 1, vocab] — extract directly (no position indexing needed).
+        // Only keep them if ALL drafts were accepted, otherwise they are invalid due to cache rewind.
+        if accepted == draftTokens.count && mtpResult.count > 1 {
+            self.mtpLogits = mtpResult.dropFirst().map { headLogits in
+                // headLogits shape: [B, 1, vocab] — squeeze to [B, vocab] for the sampler
+                headLogits[0..., headLogits.dim(1) - 1, 0...]
             }
         } else {
             self.mtpLogits = nil
@@ -1844,13 +1852,11 @@ public func generate(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
-    let isGemma4Assistant = String(describing: type(of: draftModel)).contains("Gemma4AssistantModel")
-    
+
     let iterator: any TokenIteratorProtocol
     if let mtpModel = draftModel as? DualModelMTP {
         // Set up the dual-model MTP reference
-        var mtpModelVar = mtpModel
-        mtpModelVar.mainModelRef = context.model as? any BaseLanguageModel
+        mtpModel.mainModelRef = context.model as? any BaseLanguageModel
         iterator = try MTPTokenIterator(
             input: input,
             model: mtpModel,

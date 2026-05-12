@@ -53,7 +53,7 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     var slidingWindowPattern: Int = 5
     var maxPositionEmbeddings: Int = 131072
     var attentionKeqV: Bool = false
-    var finalLogitSoftcapping: Float = 30.0
+    var finalLogitSoftcapping: Float? = 30.0
     var useDoubleWideMlp: Bool = true
     var enableMoEBlock: Bool = false
     var numExperts: Int?
@@ -137,7 +137,7 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         self.attentionKeqV =
             try container.decodeIfPresent(Bool.self, forKey: .attentionKeqV) ?? false
         self.finalLogitSoftcapping =
-            try container.decodeIfPresent(Float.self, forKey: .finalLogitSoftcapping) ?? 30.0
+            try container.decodeIfPresent(Float.self, forKey: .finalLogitSoftcapping)
         self.useDoubleWideMlp =
             try container.decodeIfPresent(Bool.self, forKey: .useDoubleWideMlp) ?? true
         self.enableMoEBlock =
@@ -289,8 +289,11 @@ private class Gemma4Attention: Module {
 
         self._qProj.wrappedValue = Linear(dim, nHeads * effectiveHeadDim, bias: false)
         
-        let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
-        let hasKv = layerIdx < firstKvSharedLayerIdx
+        // A layer owns its own K/V if it is NOT a KV-shared layer.
+        // In the Gemma 4 architecture, the main model has K/V weights for all layers even if num_kv_shared_layers > 0.
+        // However, the assistant model has numHiddenLayers == numKvSharedLayers and NO K/V weights at all.
+        let isAssistant = config.numHiddenLayers == config.numKvSharedLayers
+        let hasKv = !isAssistant
         
         if hasKv {
             self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
@@ -717,6 +720,7 @@ private class Gemma4TextModelInner: Module {
     let firstKvSharedLayerIdx: Int
     
     public var lastHiddenState: MLXArray?
+    public var hiddenStateBeforeNorm: MLXArray?
 
     init(_ config: Gemma4TextConfiguration) {
         self.config = config
@@ -868,6 +872,7 @@ private class Gemma4TextModelInner: Module {
             intermediates[idx] = (kvPair, positionOffset)
         }
 
+        self.hiddenStateBeforeNorm = h
         h = norm(h)
         self.lastHiddenState = h
         return h
@@ -881,6 +886,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     public var lastHiddenState: MLXArray? { return model.lastHiddenState }
+    public var hiddenStateBeforeNorm: MLXArray? { return model.hiddenStateBeforeNorm }
 
     fileprivate let config: Gemma4TextConfiguration
     fileprivate let model: Gemma4TextModelInner
@@ -905,7 +911,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             out = model.embedTokens.asLinear(out)
         }
-        out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
+        if let cap = config.finalLogitSoftcapping {
+            out = tanh(out / cap) * cap
+        }
         return out
     }
 
@@ -991,8 +999,20 @@ public class Gemma4AssistantModel: Module, LLMModel, DualModelMTP, KVCacheDimens
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
     
-    public var preProjectionWeight: MLXArray?
-    public var postProjectionWeight: MLXArray?
+    public var _preProjectionWeight: MLXArray?
+    public var _postProjectionWeight: MLXArray?
+    
+    public var preProjectionWeight: MLXArray? { _preProjectionWeight }
+    public var postProjectionWeight: MLXArray? { _postProjectionWeight }
+
+    // Masked embedder state (centroid-based sparse logit projection)
+    var _centroidWeight: MLXArray?       // [num_centroids, hidden] — centroids linear weight
+    var _tokenOrdering: MLXArray?        // [vocab_size] int32 — canonical token ordering (ordered->canonical)
+    var _invTokenOrdering: MLXArray?     // [vocab_size] int32 — inverse token ordering (canonical->ordered)
+    var numCentroids: Int = 2048
+    var centroidTopK: Int = 32
+    var vocabSizePerCentroid: Int = 128  // vocab_size / num_centroids
+
     // Reference to the main model so we can call it inside callMTP
     public var mainModelRef: (any BaseLanguageModel)? = nil
 
@@ -1003,9 +1023,9 @@ public class Gemma4AssistantModel: Module, LLMModel, DualModelMTP, KVCacheDimens
         self.kvHeads = (0 ..< config.numHiddenLayers).map { _ in config.numKeyValueHeads }
         self.model = Gemma4TextModelInner(config)
         
-        // Assistant projects from the main model's hidden size (backbone) to its own hidden size
-        // If backboneHiddenSize is missing, fallback to 3072 which is Gemma 4 26B's hidden size
-        let mainHiddenSize = fullConfig.backboneHiddenSize ?? 3072
+        self.numCentroids = fullConfig.numCentroids ?? 2048
+        self.centroidTopK = fullConfig.centroidIntermediateTopK ?? 32
+        self.vocabSizePerCentroid = config.vocabSize / self.numCentroids
         
         if !config.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
@@ -1016,19 +1036,97 @@ public class Gemma4AssistantModel: Module, LLMModel, DualModelMTP, KVCacheDimens
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = weights
         if let w = weights["pre_projection.weight"] {
-            self.preProjectionWeight = w
+            self._preProjectionWeight = w
             sanitized.removeValue(forKey: "pre_projection.weight")
         }
         if let w = weights["post_projection.weight"] {
-            self.postProjectionWeight = w
+            self._postProjectionWeight = w
             sanitized.removeValue(forKey: "post_projection.weight")
         }
         
-        // Remove masked_embedding as it's an OrderedCentroidEmbedding which we don't need for generation
-        sanitized = sanitized.filter { !$0.key.hasPrefix("masked_embedding") }
+        // Load masked embedder weights for centroid-based sparse logit projection
+        if let w = weights["masked_embedding.centroids.weight"] {
+            self._centroidWeight = w
+            sanitized.removeValue(forKey: "masked_embedding.centroids.weight")
+        }
+        if let w = weights["masked_embedding.token_ordering"] {
+            self._tokenOrdering = w.asType(.int32)
+            // Precompute inverse ordering: inv[canonical_id] = ordered_position
+            // This enables O(1) conversion from ordered logits to canonical logits
+            self._invTokenOrdering = argSort(w.asType(.int32), axis: 0)
+            sanitized.removeValue(forKey: "masked_embedding.token_ordering")
+        }
         
         return sanitized
     }
+
+    /// Compute logits using the centroid-based sparse masked embedder.
+    /// Matches HF Gemma4AssistantMaskedEmbedder.forward().
+    /// - hNormed: [B, 1, hidden=256]
+    /// Returns [B, 1, vocab]
+    func maskedEmbedderLogits(_ hNormed: MLXArray) -> MLXArray {
+        guard let centroidW = _centroidWeight, let tokenOrdering = _tokenOrdering else {
+            // Fallback to full projection
+            return model.embedTokens.asLinear(hNormed)
+        }
+        
+        let B = hNormed.dim(0)
+        let S = hNormed.dim(1)
+        let vocabSize = config.vocabSize
+        
+        // centroid_logits = hNormed @ centroidW.T  → [B, S, num_centroids]
+        let centroidLogits = matmul(hNormed, centroidW.T)
+        
+        // top_k_indices = argTopK(centroid_logits, k=centroidTopK) → [B, S, topK]
+        // MLX doesn't have argTopK directly; use argSort descending and take first topK
+        let sortedCentroidIdx = argSort(centroidLogits, axis: -1)  // ascending
+        let reversedIdx = sortedCentroidIdx[.ellipsis, (sortedCentroidIdx.dim(-1) - centroidTopK)...]
+        // reversedIdx is [B, S, topK] — indices of top-K centroids
+        
+        // token_ordering reshaped: [num_centroids, vocabSizePerCentroid]
+        let tokenOrderingReshaped = tokenOrdering.reshaped([numCentroids, vocabSizePerCentroid])
+        
+        // Gather canonical positions for each selected centroid
+        // For each of the topK centroid indices, gather its vocabSizePerCentroid token positions
+        // selected_canonical: [B, S, topK, vocabSizePerCentroid]
+        let topKFlat = reversedIdx.reshaped([-1])  // [B*S*topK]
+        let selectedCanonical = tokenOrderingReshaped[topKFlat]  // [B*S*topK, vocabSizePerCentroid]
+        let selectedCanonicalShaped = selectedCanonical.reshaped([B, S, centroidTopK, vocabSizePerCentroid])
+        
+        // Gather embeddings at those positions: embed_tokens.weight[canonical] → [B*S*topK*K, hidden]
+        let embedWeight = model.embedTokens.weight  // [vocab, 256]
+        let selectedFlat = selectedCanonicalShaped.reshaped([-1]).asType(.int32)  // [B*S*topK*K]
+        let selectedEmbeds = embedWeight[selectedFlat]  // [B*S*topK*K, 256]
+        let totalCandidates = centroidTopK * vocabSizePerCentroid
+        let selectedEmbedsShaped = selectedEmbeds.reshaped([B, S, totalCandidates, config.hiddenSize])
+        
+        // dot products: [B, S, 1, hidden] @ [B, S, hidden, topK*K] → [B, S, topK*K]
+        let hExpanded = hNormed.expandedDimensions(axis: -2)  // [B, S, 1, hidden]
+        let selectedLogits = matmul(hExpanded, selectedEmbedsShaped.transposed(0, 1, 3, 2)).squeezed(axis: -2)
+        // selectedLogits: [B, S, topK*K]
+        
+        // Build output tensor: fill with min - 1.0, scatter selectedLogits to canonical positions
+        let minVal = selectedLogits.min(axes: [-1], keepDims: true)  // [B, S, 1]
+        var output = broadcast(minVal - 1.0, to: [B, S, vocabSize])  // [B, S, vocab]
+        
+        // Scatter selectedLogits into output at scatterIdx positions.
+        // We use a workaround: create an index array and use scatter-add pattern.
+        // selectedLogits: [B, S, topK*K], scatterIdx: [B, S, topK*K] (token indices)
+        // For each (b,s,k): output[b, s, scatterIdx[b,s,k]] = selectedLogits[b,s,k]
+        // Use mlx scatter via the __setitem__ approach:
+        let scatterIdx2D = selectedCanonicalShaped.reshaped([B * S, totalCandidates]).asType(.int32)
+        let selectedLogits2D = selectedLogits.reshaped([B * S, totalCandidates])
+        var output2D = output.reshaped([B * S, vocabSize])
+        for bsIdx in 0 ..< B * S {
+            let idxRow = scatterIdx2D[bsIdx]  // [totalCandidates]
+            let valRow = selectedLogits2D[bsIdx]  // [totalCandidates]
+            output2D[bsIdx, idxRow] = valRow
+        }
+        output = output2D.reshaped([B, S, vocabSize])
+        
+        return output
+    }
+
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         // Fallback for standard autoregressive call, though not used in MTP flow
@@ -1044,116 +1142,161 @@ public class Gemma4AssistantModel: Module, LLMModel, DualModelMTP, KVCacheDimens
             fatalError("mainModelRef must be set on Gemma4AssistantModel before calling callMTP")
         }
 
-        // 1. Run the base model to get the main logits and its hidden state
+        let posOffset = cache?.first.map { gemma4CapturePositionOffset(from: $0) }
+
+        // 1. Run the main model to get main logits and backbone hidden state
         guard let llmMain = mainModel as? any LLMModel else {
             fatalError("mainModelRef must be an LLMModel")
         }
         let mainLogits = llmMain(inputs, cache: cache)
-        
-        // Extract hidden state. We assume mainModel is Gemma4Model -> Gemma4TextModel
-        var h = (mainModel as? Gemma4Model)?.lastHiddenState ?? inputs
+
+        // Extract the NORMALIZED hidden state from the backbone
+        var hBackbone: MLXArray
+        if let g4m = mainModel as? Gemma4Model, let lhs = g4m.lastHiddenState {
+            hBackbone = lhs
+        } else if let g4tm = mainModel as? Gemma4TextModel, let lhs = g4tm.lastHiddenState {
+            hBackbone = lhs
+        } else {
+            fatalError("[MTP] Could not extract normalized hidden state from main model")
+        }
 
         var allLogits = [mainLogits]
 
-        // 2. MTP Assistant flow
-        // The inputs array also contains the draft tokens (if any) or just the main tokens
-        // For MTP, we use the embedded draft tokens
-        let draftTokenEmbeds = model.embedTokens(inputs)
-        
-        // Assistant has `config.numHiddenLayers` (e.g. 4)
-        for i in 0 ..< config.numHiddenLayers {
-            // Apply pre-projection
-            if let preProjWeight = preProjectionWeight {
-                var w = preProjWeight
-                let hDim = h.dim(-1)
-                if w.dim(1) > hDim {
-                    w = w[.ellipsis, ..<hDim]
-                }
-                var hMatched = h
-                if hDim > w.dim(1) {
-                    hMatched = h[.ellipsis, ..<w.dim(1)]
-                }
-                h = matmul(hMatched, w.T)
-            }
-            
-            // Add draft embeddings
-            h = h + draftTokenEmbeds
+        // pre_projection: [256, 3072] — expects concat(hBackbone, embedToken) both 1536-dim → 3072
+        // post_projection: [1536, 256] — maps assistant 256-dim state back to 1536 backbone dim
 
-            // Run a SINGLE layer of the assistant model
-            // Since Gemma4Assistant uses sharedKV, we MUST pass the main cache
-            var sharedKV: (MLXArray, MLXArray)? = nil
-            if let fullCache = cache, fullCache.count > config.numHiddenLayers {
-                let layerType = model.layers[i].layerType
-                let mainIdx = layerType == "sliding_attention" ? fullCache.count - 2 : fullCache.count - 1
-                let cacheElement = fullCache[mainIdx]
-                if let c = cacheElement as? KVCacheSimple, var k = c.keys, var v = c.values {
-                    let numQHeads = config.numAttentionHeads
-                    if k.dim(1) > numQHeads {
-                        k = k[0..., ..<numQHeads, .ellipsis]
-                        v = v[0..., ..<numQHeads, .ellipsis]
-                    }
-                    sharedKV = (k, v)
-                } else if let c = cacheElement as? RotatingKVCache, var k = c.keys, var v = c.values {
-                    let numQHeads = config.numAttentionHeads
-                    if k.dim(1) > numQHeads {
-                        k = k[0..., ..<numQHeads, .ellipsis]
-                        v = v[0..., ..<numQHeads, .ellipsis]
-                    }
-                    sharedKV = (k, v)
-                }
-            }
-            
-            let layer = model.layers[i]
-            let mask = MLXFast.ScaledDotProductAttentionMaskMode.causal
-            let (out, _, _) = layer(h, mask: mask, cache: nil, perLayerInput: nil, sharedKV: sharedKV, positionOffset: nil)
-            
-            h = out
-            
-            // Apply post-projection
-            if let postProjWeight = postProjectionWeight {
-                var w = postProjWeight
-                let targetDim = (mainModel as? Gemma4TextModel)?.config.hiddenSize ?? 3072
-                if w.dim(0) > targetDim {
-                    w = w[..<targetDim, .ellipsis]
-                }
-                h = matmul(h, w.T)
-            }
-            
-            // Compute logits
-            var logits: MLXArray
-            let targetLogitsDim = (mainModelRef as? Gemma4TextModel)?.config.hiddenSize ?? (mainModelRef as? Gemma4Model)?.languageModel.config.hiddenSize ?? h.dim(-1)
-            
-            var hForLogits = h
-            if hForLogits.dim(-1) < targetLogitsDim {
-                let padding = MLX.zeros([hForLogits.dim(0), hForLogits.dim(1), targetLogitsDim - hForLogits.dim(-1)]).asType(hForLogits.dtype)
-                hForLogits = concatenated([hForLogits, padding], axis: -1)
-            } else if hForLogits.dim(-1) > targetLogitsDim {
-                hForLogits = hForLogits[.ellipsis, ..<targetLogitsDim]
-            }
-            
-            if let lmHead = _lmHead.wrappedValue {
-                logits = lmHead(hForLogits)
-            } else if let mainModel = mainModelRef as? Gemma4TextModel {
-                if let mainLmHead = mainModel.lmHead {
-                    logits = mainLmHead(hForLogits)
-                } else {
-                    logits = mainModel.model.embedTokens.asLinear(hForLogits)
-                }
-            } else if let mainModel = mainModelRef as? Gemma4Model {
-                if let mainLmHead = mainModel.languageModel.lmHead {
-                    logits = mainLmHead(hForLogits)
-                } else {
-                    logits = mainModel.languageModel.model.embedTokens.asLinear(hForLogits)
-                }
+        // For depth=0, we don't have a draft token yet — we use the LAST token from inputs as the "current" token.
+        // hBackbone[..., -1:, ...] is the hidden state after the last real token.
+        // We embed the last input token to form the first concatenation.
+        let backboneDim = hBackbone.dim(-1)  // 1536
+
+        // Get the last hidden state (the one that will predict the next token)
+        let seqLen = hBackbone.dim(1)
+        var hLast = hBackbone[0..., (seqLen-1)..<seqLen, 0...]  // [B, 1, D=1536]
+
+        let inputLen = inputs.dim(1)
+        // The assistant predicts x_{t+2} using h_t and embed(x_{t+1}).
+        // x_{t+1} is the token predicted by the main model's logits at the last position.
+        let mainLogitsLast = mainLogits[0..., -1, 0...][.newAxis]  // [B, 1, V]
+        let predictedToken = argMax(mainLogitsLast, axis: -1)      // [B, 1]
+        let lastToken = predictedToken
+        var eEmbed: MLXArray
+        if let g4tm = mainModel as? Gemma4TextModel {
+            eEmbed = g4tm.model.embedTokens(lastToken)
+            eEmbed = eEmbed * MLXArray(g4tm.model.embedScale, dtype: eEmbed.dtype)
+        } else if let g4m = mainModel as? Gemma4Model {
+            eEmbed = g4m.languageModel.model.embedTokens(lastToken)
+            eEmbed = eEmbed * MLXArray(g4m.languageModel.model.embedScale, dtype: eEmbed.dtype)
+        } else {
+            eEmbed = model.embedTokens(lastToken)
+            eEmbed = eEmbed * MLXArray(model.embedScale, dtype: eEmbed.dtype)
+        }
+
+        // The assistant uses the FIXED position of the last seen token for ALL draft steps.
+        // HF reference: position_ids = torch.tensor([[input_ids.shape[1] - 1]]) — set once, never incremented.
+        // This is (posOffset_before_main_fwd + inputLen - 1) = index of the last input token.
+        let assistantPosOffset: Gemma4PositionOffset
+        switch posOffset ?? .scalar(0) {
+        case .scalar(let off):
+            assistantPosOffset = .scalar(off + inputLen - 1)
+        case .batch(let offArr):
+            assistantPosOffset = .batch(offArr + inputLen - 1)
+        }
+
+        // Run as many depth iterations as needed for numDraftTokens + 1 (the accepted token's head)
+        // For numDraft=2 we need 2 MTP heads (depth 0 and 1 give us draft 1 and draft 2).
+        // Running only what we need avoids extra compute.
+        let mtpDepth = (mtpCaches?.count ?? 0) + 2  // fallback: 2 depths for 2 draft tokens
+
+        for _ in 0 ..< mtpDepth {
+            // Step A: Concatenate token embedding + backbone hidden state → [B, 1, 3072]
+            // HF does torch.cat([last_token_embedding, last_hidden_state], dim=-1)
+            let hConcat = concatenated([eEmbed, hLast], axis: -1)  // [B, 1, 3072]
+
+            // Step B: Pre-projection → [B, 1, 256]
+            var hAssistant: MLXArray
+            if let preProjWeight = preProjectionWeight {
+                hAssistant = matmul(hConcat, preProjWeight.T)  // [B, 1, 256]
             } else {
-                fatalError("No lm_head found and tie_word_embeddings is false.")
+                hAssistant = hConcat
             }
-            
-            if config.finalLogitSoftcapping > 0.0 {
-                logits = tanh(logits / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
+
+            // Step C: Run all 4 assistant transformer layers
+            for i in 0 ..< config.numHiddenLayers {
+                let layer = model.layers[i]
+                
+                // Pass main model KV cache as sharedKV for cross-attention
+                var sharedKV: (MLXArray, MLXArray)? = nil
+                if let fullCache = cache {
+                    let layerType = model.layers[i].layerType
+                    // Assistant layers attend to the main model's last SWA or FA cache
+                    // Full-attention layers use the last full-attention cache; SWA uses last SWA cache
+                    let mainIdx = layerType == "sliding_attention" ? fullCache.count - 2 : fullCache.count - 1
+                    if mainIdx >= 0 {
+                        let cacheElement = fullCache[mainIdx]
+                        if let c = cacheElement as? KVCacheSimple, let k = c.keys, let v = c.values {
+                            // Slice to valid offset (avoid zero-padded buffer positions)
+                            let validK = k[0..., 0..., 0..<c.offset, 0...]  // [B, nKVH, S, headDim]
+                            let validV = v[0..., 0..., 0..<c.offset, 0...]
+                            sharedKV = (validK, validV)
+                        } else if let c = cacheElement as? RotatingKVCache, let k = c.keys, let v = c.values {
+                            let validLen = min(c.offset, k.dim(2))
+                            let validK = k[0..., 0..., 0..<validLen, 0...]
+                            let validV = v[0..., 0..., 0..<validLen, 0...]
+                            sharedKV = (validK, validV)
+                        }
+                    }
+                }
+                let (out, _, _) = layer(hAssistant, mask: nil, cache: nil, perLayerInput: nil, sharedKV: sharedKV, positionOffset: assistantPosOffset)
+                hAssistant = out
             }
-            
+
+            // Step D: Final norm
+            let hNormed = model.norm(hAssistant)  // [B, 1, 256]
+            // Step E: Compute logits.
+            // The masked embedder scatters logits at CANONICAL positions directly using token_ordering as scatter index.
+            // Output is already in canonical space — NO inv_ordering remapping needed.
+            // See: modeling_gemma4_assistant.py Gemma4AssistantMaskedEmbedder.forward() lines 79-87.
+            let logits: MLXArray
+            if _centroidWeight != nil {
+                logits = maskedEmbedderLogits(hNormed)  // [B, 1, vocab] in canonical space already
+            } else {
+                // Fallback: simple linear projection (no ordered embeddings)
+                logits = model.embedTokens.asLinear(hNormed)
+            }
+
+            // Note: MTP head logits are [B, 1, vocab] (single position, no padding needed).
+            // Evaluate.swift extracts the last position when reading from mtpResult[1...].
+
             allLogits.append(logits)
+
+            // Step F: Post-projection → get new backbone-dim hidden state for next depth concat
+            if let postProjWeight = postProjectionWeight {
+                hLast = matmul(hNormed, postProjWeight.T)  // [B, 1, 1536]
+            } else {
+                hLast = hNormed
+            }
+
+            // Step G: The next depth's token embedding is sampled from the logits we just produced.
+            // Use greedy sampling here (temp=0 equivalent) for the chain.
+            // logits is [B, S, vocab]; take last position
+            let lastLogits = logits[0..., logits.dim(1)-1, 0...]  // [B, vocab]
+            let nextTokenScalar = argMax(lastLogits, axis: -1)  // [B]
+            // Reshape to [B, 1] for embedding
+            let nextTokenReshaped = nextTokenScalar.reshaped([1, 1])  // [1, 1] for batch=1
+            if let g4tm = mainModel as? Gemma4TextModel {
+                eEmbed = g4tm.model.embedTokens(nextTokenReshaped)  // [1, 1, 1536]
+                eEmbed = eEmbed * MLXArray(g4tm.model.embedScale, dtype: eEmbed.dtype)
+            } else if let g4m = mainModel as? Gemma4Model {
+                eEmbed = g4m.languageModel.model.embedTokens(nextTokenReshaped)  // [1, 1, 1536]
+                eEmbed = eEmbed * MLXArray(g4m.languageModel.model.embedScale, dtype: eEmbed.dtype)
+            } else {
+                eEmbed = model.embedTokens(nextTokenReshaped)
+                eEmbed = eEmbed * MLXArray(model.embedScale, dtype: eEmbed.dtype)
+            }
+            
+            // NOTE: position_ids stays FIXED — do NOT increment it between draft steps.
+            // (Matches HF SinglePositionMultiTokenCandidateGenerator.get_candidates)
         }
 
         return allLogits

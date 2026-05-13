@@ -1116,7 +1116,7 @@ public class Gemma4AssistantModel: Module, LLMModel, DualModelMTP, KVCacheDimens
         // Use mlx scatter via the __setitem__ approach:
         let scatterIdx2D = selectedCanonicalShaped.reshaped([B * S, totalCandidates]).asType(.int32)
         let selectedLogits2D = selectedLogits.reshaped([B * S, totalCandidates])
-        var output2D = output.reshaped([B * S, vocabSize])
+        let output2D = output.reshaped([B * S, vocabSize])
         let rowIndices = MLXArray.arange(B * S).asType(.int32).reshaped([B * S, 1])
         output2D[rowIndices, scatterIdx2D] = selectedLogits2D
         output = output2D.reshaped([B, S, vocabSize])

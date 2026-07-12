@@ -79,7 +79,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     case glm4
 
     /// Gemma function call format.
-    /// Example: `call:name{key:value,k:<escape>str<escape>}`
+    /// Example: `<start_function_call>call:name{key:value,k:<escape>str<escape>}<end_function_call>`
     case gemma
 
     /// Gemma 4 function call format.
@@ -129,6 +129,18 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return MistralToolCallParser()
         case .llama3:
             return Llama3ToolCallParser()
+        }
+    }
+
+    /// Generate an ID compatible with this tool-call syntax.
+    func generateToolCallID() -> String {
+        let uuid = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+
+        switch self {
+        case .mistral:
+            return String(uuid.prefix(9))
+        default:
+            return "call_" + uuid.lowercased()
         }
     }
 

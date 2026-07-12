@@ -39,17 +39,21 @@ let package = Package(
         // ── Dependency Update Flow ────────────────────────────────────────────────
         // ml-explore/mlx-swift  →  SharpAI/mlx-swift (sync bot PR + CI)
         //
-        // SharpAI/mlx-swift adds custom Metal ops NOT in Apple upstream:
+        // agoodkind/mlx-swift (a fork of SharpAI/mlx-swift) adds custom Metal ops
+        // NOT in Apple upstream:
         //   MLXFast.turboDecodeK/V, turboQuantEncode  (TurboKV compression)
         //   MLXFast.preadInto, prefault               (SSD streaming)
-        // We MUST depend on the SharpAI fork, NOT ml-explore/mlx-swift.
+        // We MUST depend on the agoodkind fork, NOT ml-explore/mlx-swift.
+        // Using agoodkind/mlx-swift here (rather than SharpAI/mlx-swift) keeps a
+        // single mlx-swift package identity across lmd's manifests, avoiding the
+        // SwiftPM "conflicting identity for mlx-swift" resolution warning.
         //
         // This package uses a local path reference so the exact commit is
         // controlled by WhichEver repo (SwiftLM) has both as submodules.
-        // In standalone CI, the checkout step clones SharpAI/mlx-swift
+        // In standalone CI, the checkout step clones agoodkind/mlx-swift
         // into ../mlx-swift so this path resolves correctly.
         // ─────────────────────────────────────────────────────────────────────────
-        .package(url: "https://github.com/SharpAI/mlx-swift.git", branch: "main"),
+        .package(url: "https://github.com/agoodkind/mlx-swift.git", branch: "main"),
 
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
     ],

@@ -147,8 +147,35 @@ public struct UserInput {
     public struct Processing: Sendable {
         public var resize: CGSize?
 
-        public init(resize: CGSize? = nil) {
+        public var audio = AudioProcessing()
+
+        /// Optional per-call overrides for the image resize budget. When set,
+        /// they replace the model's configured `min_pixels` / `max_pixels` for
+        /// this request; when `nil` the model configuration is used. This lets
+        /// a caller request the resolution a model was tuned for without
+        /// hard-coding pixel counts in the processor.
+        public var minPixels: Int?
+        public var maxPixels: Int?
+
+        public init(resize: CGSize? = nil, minPixels: Int? = nil, maxPixels: Int? = nil) {
             self.resize = resize
+            self.minPixels = minPixels
+            self.maxPixels = maxPixels
+        }
+    }
+
+    /// Representation of audio processing
+    public struct AudioProcessing: Sendable {
+        /// Sample rate
+        public var sampleRate = 48_000.0
+
+        /// Number of channels of audio.  If 1, convert to mono
+        public var channels = 1
+
+        /// audio format
+        public var audioFormat: AudioFormatID = kAudioFormatLinearPCM
+
+        public init() {
         }
     }
 
@@ -204,6 +231,7 @@ public struct UserInput {
     ///   - prompt: text prompt
     ///   - images: optional images
     ///   - videos: optional videos
+    ///   - audios: optional audios
     ///   - tools: optional tool specifications
     ///   - additionalContext: optional context (model specific)
     /// ### See Also
@@ -218,6 +246,10 @@ public struct UserInput {
         self.prompt = .chat([
             .user(prompt, images: images, videos: videos, audio: audio)
         ])
+        // note: prompt.didSet is not triggered in init
+        self.images = images
+        self.videos = videos
+        self.audios = audios
         self.tools = tools
         self.additionalContext = additionalContext
     }
@@ -243,13 +275,15 @@ public struct UserInput {
     /// ]
     /// ```
     ///
-    /// Typically the ``init(chat:processing:tools:additionalContext:)`` should be used instead
-    /// along with a model specific ``MessageGenerator`` (supplied by the ``UserInputProcessor``).
+    /// Typically the ``init(chat:processing:tools:additionalContext:)``
+    /// should be used instead along with a model specific
+    /// ``MessageGenerator`` (supplied by the ``UserInputProcessor``).
     ///
     /// - Parameters:
     ///   - messages: array of dictionaries representing the prompt in a model specific format
     ///   - images: optional images
     ///   - videos: optional videos
+    ///   - audios: optional audios
     ///   - tools: optional tool specifications
     ///   - additionalContext: optional context (model specific)
     /// ### See Also
@@ -318,12 +352,14 @@ public struct UserInput {
 
     /// Initialize the `UserInput` with a preconfigured ``Prompt-swift.enum``.
     ///
-    /// ``init(chat:processing:tools:additionalContext:)`` is the preferred mechanism.
+    /// ``init(chat:processing:tools:additionalContext:)`` is
+    /// the preferred mechanism.
     ///
     /// - Parameters:
     ///   - prompt: the prompt
     ///   - images: optional images
     ///   - videos: optional videos
+    ///   - audios: optional audios
     ///   - tools: optional tool specifications
     ///   - processing: optional processing to be applied to media
     ///   - additionalContext: optional context (model specific)
@@ -339,6 +375,7 @@ public struct UserInput {
         tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil
     ) {
         self.prompt = prompt
+        // note: prompt.didSet is not triggered in init
         switch prompt {
         case .text, .messages:
             self.images = images
@@ -364,6 +401,7 @@ internal enum UserInputError: LocalizedError {
     case notImplemented
     case unableToLoad(URL)
     case arrayError(String)
+    case noAudioData(URL)
 
     var errorDescription: String? {
         switch self {
@@ -373,6 +411,8 @@ internal enum UserInputError: LocalizedError {
             return String(localized: "Unable to load image from URL: \(url.path).")
         case .arrayError(let message):
             return String(localized: "Error processing image array: \(message).")
+        case .noAudioData(let url):
+            return String(localized: "No audio data in file: \(url.path)")
         }
     }
 }

@@ -17,6 +17,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Configure Git
         run: |
@@ -30,6 +31,8 @@ jobs:
         run: git fetch upstream
 
       - name: Create or Update Sync Branch
+        env:
+          SYNC_PUSH_TOKEN: ${{ secrets.SWIFTLM_PR_TOKEN }}
         run: |
           git checkout -B sync/upstream-latest
           # Merge upstream instead of hard reset so SharpAI-specific changes
@@ -42,7 +45,7 @@ jobs:
           sed -i "s|package(url: \"https://github.com/ml-explore/mlx-swift.*|package(url: \"https://github.com/SharpAI/mlx-swift.git\", exact: \"${CURRENT_TAG}\"),|" Package.swift
           git add Package.swift
           git diff --cached --quiet || git commit -m "chore(sync): restore SharpAI mlx-swift fork dependency after upstream merge"
-          git push -f origin sync/upstream-latest
+          git push -f "https://x-access-token:${SYNC_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" sync/upstream-latest
 
       - name: Create Pull Request to Main
         env:

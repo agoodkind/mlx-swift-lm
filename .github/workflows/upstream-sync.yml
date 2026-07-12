@@ -49,8 +49,12 @@ jobs:
 
       - name: Create Pull Request to Main
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.SWIFTLM_PR_TOKEN }}
         run: |
+          if gh pr view sync/upstream-latest --json state --jq '.state' 2>/dev/null | grep -q OPEN; then
+            echo "PR already open for sync/upstream-latest."
+            exit 0
+          fi
           gh pr create --base main --head sync/upstream-latest \
             --title "🔄 Auto-Sync: Apple Upstream Repository" \
-            --body "Automated PR to synchronize SharpAI fork with Apple mlx-swift-lm upstream repository. Please review merge conflicts (if any) and verify CI pipelines." || echo "PR already exists or no changes"
+            --body "Automated PR to synchronize SharpAI fork with Apple mlx-swift-lm upstream repository. Please review merge conflicts (if any) and verify CI pipelines."

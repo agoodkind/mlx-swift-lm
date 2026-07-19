@@ -505,6 +505,9 @@ protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int 
     var streamingError: SSDStreamingError? { get }
     var acceptedDraftTokens: Int { get }
     var totalDraftTokens: Int { get }
+
+    /// Log-probability of the token most recently returned by `next()`.
+    var lastLogprob: Float { get }
 }
 
 /// Generator of tokens.
@@ -553,6 +556,11 @@ public struct TokenIterator: TokenIteratorProtocol {
     let ssdErrorLatch = SSDStreamingErrorLatch()
     var acceptedDraftTokens = 0
     var totalDraftTokens = 0
+
+    /// Log-probability of the token most recently returned by `next()`.
+    public var lastLogprob: Float = 0
+    /// Log-probability of the current `y` (the token `next()` will return next).
+    private var yLogprob: Float = 0
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
@@ -687,6 +695,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         // transform logits back to a token
         let y = sampler.sample(logits: logits)
 
+        // Chosen-token log-probability from the processed logits (OpenAI-style
+        // logprobs): logSoftmax over the full vocab, gathered at the sampled token.
+        yLogprob = takeAlong(logSoftmax(logits), y.reshaped([1, 1]), axis: -1).item(Float.self)
+
         processor?.didSample(token: y)
 
         return y
@@ -723,6 +735,8 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         // save current value -- this will be returned
         let previousY = y
+        // logprob of the token being returned, captured before step() overwrites yLogprob
+        let previousLogprob = yLogprob
 
         // compute the next state and async eval the next token
         let token: MLXArray
@@ -741,6 +755,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         tokenCount += 1
 
+        lastLogprob = previousLogprob
         return previousY.tokens.item(Int.self)
     }
 }
@@ -800,6 +815,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     var promptPrefillTime: TimeInterval = 0.0
     var acceptedDraftTokens = 0
     var totalDraftTokens = 0
+
+    /// Log-probability of the token most recently returned by `next()`.
+    /// Speculative decoding does not currently compute per-token logprobs.
+    public var lastLogprob: Float = 0
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -1106,6 +1125,10 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
     public var acceptedDraftTokens: Int = 0
     public var totalDraftTokens: Int = 0
     var promptPrefillTime: TimeInterval = 0.0
+
+    /// Log-probability of the token most recently returned by `next()`.
+    /// MTP speculative decoding does not currently compute per-token logprobs.
+    public var lastLogprob: Float = 0
 
     /// Initialize a `MTPTokenIterator` with the given input.
     public init(
@@ -2194,6 +2217,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             )
 
             while let token = iterator.next() {
+                let tokenLogprob = iterator.lastLogprob
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
                     stopReason = .cancelled
@@ -2210,7 +2234,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
                     if includeStopToken {
                         tokenCount += 1
-                        if !handler.onStopToken(token, emit: continuation.yield) {
+                        if !handler.onStopToken(token, logprob: tokenLogprob, emit: continuation.yield) {
                             stopReason = .cancelled
                             break
                         }
@@ -2220,7 +2244,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
 
                 tokenCount += 1
-                if !handler.onToken(token, emit: continuation.yield) {
+                if !handler.onToken(token, logprob: tokenLogprob, emit: continuation.yield) {
                     stopReason = .cancelled
                     break
                 }
@@ -2370,7 +2394,7 @@ public enum Generation: Sendable {
     /// A generated text chunk as a String, paired with the raw token ID that produced it.
     /// The token ID can be used to detect special tokens (e.g. gpt-oss channel markers)
     /// without relying on text matching.
-    case chunk(String, tokenId: Int)
+    case chunk(String, tokenId: Int, logprob: Float)
 
     /// Completion information summarizing token counts and performance metrics.
     case info(GenerateCompletionInfo)
@@ -2381,7 +2405,7 @@ public enum Generation: Sendable {
     /// Generated text or nil
     public var chunk: String? {
         switch self {
-        case .chunk(let string, _): string
+        case .chunk(let string, _, _): string
         case .info: nil
         case .toolCall: nil
         }
@@ -2390,7 +2414,7 @@ public enum Generation: Sendable {
     /// Completion info or nil
     public var info: GenerateCompletionInfo? {
         switch self {
-        case .chunk(_, _): nil
+        case .chunk(_, _, _): nil
         case .info(let info): info
         case .toolCall: nil
         }
@@ -2455,12 +2479,14 @@ private protocol TokenLoopHandler: Sendable {
     /// Return false to stop the loop early.
     mutating func onToken(
         _ token: Int,
+        logprob: Float,
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
     ) -> Bool
 
     /// Called only when includeStopToken == true and a stop token was hit.
     mutating func onStopToken(
         _ token: Int,
+        logprob: Float,
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
     ) -> Bool
 
@@ -2485,13 +2511,14 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
 
     mutating func onToken(
         _ token: Int,
+        logprob: Float,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> Bool {
         detokenizer.append(token: token)
         if let chunk = detokenizer.next() {
             // Process chunk through the tool call processor.
             if let textToYield = toolCallProcessor.processChunk(chunk) {
-                if case .terminated = emit(.chunk(textToYield, tokenId: token)) {
+                if case .terminated = emit(.chunk(textToYield, tokenId: token, logprob: logprob)) {
                     return false
                 }
             }
@@ -2509,6 +2536,7 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
 
     mutating func onStopToken(
         _ token: Int,
+        logprob: Float,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> Bool {
         true
@@ -2536,6 +2564,7 @@ private struct RawTokenLoopHandler: TokenLoopHandler {
 
     mutating func onToken(
         _ token: Int,
+        logprob: Float,
         emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
     ) -> Bool {
         if case .terminated = emit(.token(token)) {
@@ -2546,6 +2575,7 @@ private struct RawTokenLoopHandler: TokenLoopHandler {
 
     mutating func onStopToken(
         _ token: Int,
+        logprob: Float,
         emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
     ) -> Bool {
         if case .terminated = emit(.token(token)) {

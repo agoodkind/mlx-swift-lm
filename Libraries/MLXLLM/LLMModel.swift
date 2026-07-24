@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+import Foundation
 import MLX
 import MLXLMCommon
 
@@ -31,7 +32,9 @@ extension LLMModel {
     ///
     /// This will evaluate the prompt in chunks until there is a small number of
     /// tokens left to feed into the `TokenIterator`.
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, windowSize: Int?
+    ) throws
         -> PrepareResult
     {
         let prefillStepSize = windowSize ?? 512

@@ -262,7 +262,7 @@ final class Qwen35GatedDeltaNet: Module {
 
         let convInput = concatenated([convState, qkv], axis: 1)
         if let cache {
-            cache[0] = convInput[0..., (-(convKernelSize - 1))...]
+            cache[0] = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
         }
 
         let convOut = silu(conv1d(convInput))
@@ -298,6 +298,7 @@ final class Qwen35GatedDeltaNet: Module {
 
         if let cache {
             cache[1] = state
+            cache.advance(S)
         }
 
         out = norm(out, gate: z)
@@ -388,8 +389,9 @@ final class Qwen35Attention: Module {
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -459,7 +461,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         }
 
         let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let combined = weightedExpertSum(y, scores)
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY

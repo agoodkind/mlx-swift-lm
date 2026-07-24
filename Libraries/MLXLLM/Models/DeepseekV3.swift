@@ -195,20 +195,14 @@ class DeepseekV3Attention: Module {
         kv = kv.reshaped(B, L, self.numHeads, -1).transposed(0, 2, 1, 3)
         let splitKv = split(kv, indices: [self.qkNopeHeadDim], axis: -1)
 
-        var (kNope, values) = (splitKv[0], splitKv[1])
+        let (kNope, values) = (splitKv[0], splitKv[1])
 
-        qPe = applyRotaryPosition(rope, to: qPe, cache: cache)
-        kPe = applyRotaryPosition(rope, to: kPe, cache: cache)
+        let offset = cache?.ropeOffset
+        qPe = applyRotaryPosition(rope, to: qPe, offset: offset)
+        kPe = applyRotaryPosition(rope, to: kPe, offset: offset)
         kPe = repeated(kPe, count: numHeads, axis: 1)
 
-        var keys: MLXArray
-        if let cache = cache {
-            (keys, values) = cache.update(
-                keys: concatenated([kNope, kPe], axis: -1), values: values)
-        } else {
-            keys = concatenated([kNope, kPe], axis: -1)
-        }
-
+        let keys = concatenated([kNope, kPe], axis: -1)
         let queries = concatenated([qNope, qPe], axis: -1)
 
         let output = attentionWithCacheUpdate(
@@ -329,7 +323,7 @@ class DeepseekV3MoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
         var y = switchMLP(x, indices)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        y = weightedExpertSum(y, scores)
 
         if let shared = sharedExperts {
             y = y + shared(x)
@@ -420,14 +414,15 @@ public class DeepseekV3ModelInner: Module, LayerPartitionable, StreamableMoE {
 }
 
 public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
-    public var kvHeads: [Int] = []
+    public var kvHeads: [Int]
 
     var args: DeepseekV3Configuration
     public var model: DeepseekV3ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
-    init(_ args: DeepseekV3Configuration) {
+    public init(_ args: DeepseekV3Configuration) {
         self.args = args
+        self.kvHeads = Array(repeating: args.numKeyValueHeads, count: args.numHiddenLayers)
         self.model = DeepseekV3ModelInner(config: args)
         self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }

@@ -31,26 +31,68 @@ jobs:
         run: git fetch upstream
 
       - name: Create or Update Sync Branch
+        id: sync_branch
         env:
           SYNC_PUSH_TOKEN: ${{ secrets.SWIFTLM_PR_TOKEN }}
         run: |
-          git checkout -B sync/upstream-latest
-          # Merge upstream instead of hard reset so SharpAI-specific changes
-          # (Package.swift fork dependencies, custom op hooks) are preserved.
-          git merge upstream/main --no-edit --strategy-option=ours --allow-unrelated-histories || true
-          # Always restore the SharpAI fork dependency — upstream will overwrite
-          # this with ml-explore/mlx-swift, which lacks TurboKV/SSD Metal ops.
-          # The tag is bumped separately by update_dependencies.yml.
-          CURRENT_TAG=$(grep -oP '(?<=exact: ")([^"]+)' Package.swift || echo "0.30.6")
-          sed -i "s|package(url: \"https://github.com/ml-explore/mlx-swift.*|package(url: \"https://github.com/SharpAI/mlx-swift.git\", exact: \"${CURRENT_TAG}\"),|" Package.swift
-          git add Package.swift
-          git diff --cached --quiet || git commit -m "chore(sync): restore SharpAI mlx-swift fork dependency after upstream merge"
+          git checkout -B sync/upstream-latest origin/main
+
+          # This fork was reconstructed and does not share history with Apple
+          # upstream, so ancestry checks like origin/main..upstream/main list
+          # every upstream commit and cannot tell whether upstream advanced.
+          # Track the last-synced upstream SHA in a committed state file, which
+          # survives whichever merge method the human picks (merge or squash).
+          STATE_FILE=".github/upstream-sync-state"
+          UPSTREAM_SHA="$(git rev-parse upstream/main)"
+          LAST_SYNCED=""
+          if [ -f "$STATE_FILE" ]; then
+            LAST_SYNCED="$(cat "$STATE_FILE")"
+          fi
+          if [ "$LAST_SYNCED" = "$UPSTREAM_SHA" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged since last sync (${UPSTREAM_SHA})."
+            exit 0
+          fi
+
+          # Merge upstream with the fork winning every conflict, so the branch
+          # keeps the fork's build wiring (the agoodkind/mlx-swift dependency and
+          # the custom generation loop) and stays buildable for CI. Because the
+          # histories are unrelated, this can still graft upstream files that
+          # reference symbols the fork dropped, so the PR must not be merged until
+          # the fork CI is green. Do not swallow failures: a hard merge error must
+          # fail the job instead of pushing a broken tree.
+          git merge -X ours --no-edit --allow-unrelated-histories \
+            -m "chore: sync with upstream/main [skip ci]" upstream/main
+
+          echo "${UPSTREAM_SHA}" > "$STATE_FILE"
+          git add "$STATE_FILE"
+          git commit -m "chore(sync): record upstream/main @ ${UPSTREAM_SHA} [skip ci]"
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
           git push -f "https://x-access-token:${SYNC_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" sync/upstream-latest
 
       - name: Create Pull Request to Main
+        if: steps.sync_branch.outputs.has_changes == 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr create --base main --head sync/upstream-latest \
-            --title "🔄 Auto-Sync: Apple Upstream Repository" \
-            --body "Automated PR to synchronize SharpAI fork with Apple mlx-swift-lm upstream repository. Please review merge conflicts (if any) and verify CI pipelines." || echo "PR already exists or no changes"
+          EXISTING_PR_NUMBER="$(gh api --method GET \
+            "/repos/${GITHUB_REPOSITORY}/pulls" \
+            -f base=main \
+            -f head="${GITHUB_REPOSITORY_OWNER}:sync/upstream-latest" \
+            -f state=open \
+            --jq '.[0].number // empty')"
+          if [ -n "$EXISTING_PR_NUMBER" ]; then
+            echo "PR #${EXISTING_PR_NUMBER} already open for sync/upstream-latest."
+            exit 0
+          fi
+
+          PR_BODY=$'Automated PR to synchronize the fork with Apple mlx-swift-lm upstream.\n\nThe merge uses `-X ours` across unrelated histories, so the fork build wiring wins on conflict and the branch stays buildable. This can graft upstream files that reference symbols the fork dropped, so **do not merge until the fork CI is green and a human has reviewed the diff**. A real vendored-core bump is manual work; this only carries upstream forward for review.'
+
+          gh api --method POST \
+            "/repos/${GITHUB_REPOSITORY}/pulls" \
+            -f base=main \
+            -f head="${GITHUB_REPOSITORY_OWNER}:sync/upstream-latest" \
+            -f title="🔄 Auto-Sync: Apple Upstream Repository" \
+            -f body="$PR_BODY" \
+            --jq '.html_url'

@@ -1,6 +1,6 @@
 # Repair upstream sync pull request authentication
 
-## Current behavior
+## Baseline behavior
 
 The daily upstream sync fetches, merges, and pushes `sync/upstream-latest`.
 Pull request creation then fails because it uses `github.token` while repository

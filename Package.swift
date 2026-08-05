@@ -37,17 +37,16 @@ let package = Package(
     ],
     dependencies: [
         // ── Dependency Update Flow ────────────────────────────────────────────────
-        // ml-explore/mlx-swift  →  SharpAI/mlx-swift (sync bot PR + CI)
+        // ml-explore/mlx-swift  →  agoodkind/mlx-swift (sync bot PR + CI)
         //
-        // SharpAI/mlx-swift adds custom Metal ops NOT in Apple upstream:
+        // agoodkind/mlx-swift adds custom Metal ops NOT in Apple upstream:
         //   MLXFast.turboDecodeK/V, turboQuantEncode  (TurboKV compression)
         //   MLXFast.preadInto, prefault               (SSD streaming)
-        // We MUST depend on the SharpAI fork, NOT ml-explore/mlx-swift.
+        // We MUST depend on the agoodkind fork, NOT ml-explore/mlx-swift.
         //
-        // This package uses a local path reference so the exact commit is
-        // controlled by WhichEver repo (SwiftLM) has both as submodules.
-        // In standalone CI, the checkout step clones SharpAI/mlx-swift
-        // into ../mlx-swift so this path resolves correctly.
+        // Standalone builds track the fork's main branch. CI rewrites this to
+        // its agoodkind/mlx-swift checkout. SwiftLM integration preserves the
+        // recursive submodule pins from agoodkind/SwiftLM.
         // ─────────────────────────────────────────────────────────────────────────
         .package(url: "https://github.com/agoodkind/mlx-swift.git", branch: "main"),
 

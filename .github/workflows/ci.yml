@@ -15,8 +15,8 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Build and Test (macOS 15)
-    runs-on: macos-15
+    name: Build and Test (macOS 26)
+    runs-on: macos-26
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -37,15 +37,15 @@ jobs:
       - name: Clear stale module cache
         run: find .build -type d -name ModuleCache -exec rm -rf {} + 2>/dev/null || true
 
-      - name: Checkout SharpAI/mlx-swift
+      - name: Checkout agoodkind/mlx-swift
         uses: actions/checkout@v4
         with:
-          repository: SharpAI/mlx-swift
+          repository: agoodkind/mlx-swift
           path: mlx-swift
 
       - name: Redirect mlx-swift dependency to local checkout
         run: |
-          sed -i '' -E 's|\.package\(path: "\.\./mlx-swift"\),|\.package(path: "./mlx-swift"),|' Package.swift
+          sed -i '' -E 's|\.package\(url: "https://github.com/agoodkind/mlx-swift.git", branch: "main"\),|\.package(path: "./mlx-swift"),|' Package.swift
 
       - name: Resolve dependencies
         run: swift package resolve
@@ -101,7 +101,7 @@ jobs:
 
   integration-test:
     name: Build & Test SwiftLM Integration
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: Checkout mlx-swift-lm (this repository)
         uses: actions/checkout@v4
@@ -112,7 +112,7 @@ jobs:
       - name: Checkout SwiftLM
         uses: actions/checkout@v4
         with:
-          repository: SharpAI/SwiftLM
+          repository: agoodkind/SwiftLM
           path: SwiftLM
           submodules: recursive
 
@@ -124,12 +124,6 @@ jobs:
           rm -rf mlx-swift-lm
           cp -r ../mlx-swift-lm .
 
-      - name: Update mlx-swift submodule to latest main
-        run: |
-          cd SwiftLM/mlx-swift
-          git fetch origin main
-          git checkout origin/main
-          
       - name: Build SwiftLM
         run: |
           cd SwiftLM

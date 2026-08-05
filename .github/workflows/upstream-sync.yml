@@ -74,7 +74,7 @@ jobs:
       - name: Create Pull Request to Main
         if: steps.sync_branch.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SWIFTLM_PR_TOKEN }}
         run: |
           EXISTING_PR_NUMBER="$(gh api --method GET \
             "/repos/${GITHUB_REPOSITORY}/pulls" \

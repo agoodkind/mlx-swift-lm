@@ -417,7 +417,9 @@ extension MLXTestingSuite {
                 context: ctx,
                 numMTPTokens: 1
             ) {
-                if case .chunk(_, _) = generation { tokenCount += 1 }
+                if case .chunk = generation {
+                    tokenCount += 1
+                }
             }
             #expect(tokenCount > 0,
                     "generateMTP must produce output tokens even with no MTP heads")

@@ -15,8 +15,8 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Build and Test (macOS 15)
-    runs-on: macos-15
+    name: Build and Test (macOS 26)
+    runs-on: macos-26
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -101,7 +101,7 @@ jobs:
 
   integration-test:
     name: Build & Test SwiftLM Integration
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: Checkout mlx-swift-lm (this repository)
         uses: actions/checkout@v4

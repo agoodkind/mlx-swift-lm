@@ -7,7 +7,7 @@ on:
 jobs:
   test-swiftlm-umbrella:
     name: Test with SwiftLM (Umbrella Repo)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 40
     steps:
       - name: Checkout PR branch (mlx-swift-lm)

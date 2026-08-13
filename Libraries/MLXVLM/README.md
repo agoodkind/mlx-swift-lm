@@ -68,6 +68,7 @@ The following models have been tried:
 - mlx-community/gemma-3-12b-it-qat-4bit
 - mlx-community/gemma-3-27b-it-qat-4bit
 - HuggingFaceTB/SmolVLM2-500M-Video-Instruct-mlx
+- mlx-community/Muse-Glimmer-30B-4bit
 
 Currently supported model types are:
 
@@ -78,6 +79,7 @@ Currently supported model types are:
 - idefics3
 - gemma3
 - smolvlm
+- muse_glimmer
 
 See [llm-tool](../../Tools/llm-tool)
 
@@ -270,21 +272,34 @@ public class YourModel: Module, VLMModel, KVCacheDimensionProvider {
         self._languageModel.wrappedValue = Language.LanguageModel(config.textConfiguration)
     }
 
-    public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
-        // TODO prepare the cache and resulting logits based on the
-        // text prompt and any media assets
+        // Merge image and text embeddings, then prefill the KV cache in
+        // chunks. Single-pass prefill allocates transient buffers
+        // proportional to prompt length and causes OOM on long prompts.
         guard let image = input.image else { throw VLMError.imageRequired }
         guard let mask = input.text.mask else { throw VLMError.maskRequired }
-        let inputIds = input.text.tokens
+        var inputIds = input.text.tokens
+        if inputIds.ndim == 1 { inputIds = inputIds.expandedDimensions(axis: 0) }
 
-        let inputEmbedding = inputEmbeddings(
+        let allEmbeds = inputEmbeddings(
             inputIds: inputIds, pixelValues: image.pixels, mask: mask)
 
+        let totalPositions = allEmbeds.dim(1)
+        let processed = try prefill.forEachChunk(total: totalPositions) { range in
+            _ = languageModel(inputIds[0..., range], cache: cache,
+                              inputEmbedding: allEmbeds[0..., range, 0...], mask: mask)
+            asyncEval(cache)
+        }
+        if processed > 0 { eval(cache) }
         let result = languageModel(
-            inputIds, cache: cache, inputEmbedding: inputEmbedding, mask: mask)
-
+            inputIds[0..., processed...], cache: cache,
+            inputEmbedding: allEmbeds[0..., processed..., 0...], mask: mask)
+        prefill.progress?(totalPositions, totalPositions)
         return .logits(result)
     }
 

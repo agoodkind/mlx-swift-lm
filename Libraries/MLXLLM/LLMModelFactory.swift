@@ -10,6 +10,9 @@ private func create<C: Codable, M>(
 ) -> (Data) throws -> M {
     { data in
         let configuration = try JSONDecoder.json5().decode(C.self, from: data)
+        if let validating = configuration as? ModelConfigurationValidating {
+            try validating.validateModelConfiguration()
+        }
         return modelInit(configuration)
     }
 }
@@ -22,6 +25,7 @@ public enum LLMTypeRegistry {
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
         "mistral": create(LlamaConfiguration.self, LlamaModel.init),
+        "mixtral": create(MixtralConfiguration.self, MixtralModel.init),
         "llama": create(LlamaConfiguration.self, LlamaModel.init),
         "phi": create(PhiConfiguration.self, PhiModel.init),
         "phi3": create(Phi3Configuration.self, Phi3Model.init),
@@ -32,6 +36,7 @@ public enum LLMTypeRegistry {
         "gemma3_text": create(Gemma3TextConfiguration.self, Gemma3TextModel.init),
         "gemma3n": create(Gemma3nTextConfiguration.self, Gemma3nTextModel.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4Model.init),
+        "gemma4_unified": create(Gemma4Configuration.self, Gemma4Model.init),
         "gemma4_text": create(Gemma4TextConfiguration.self, Gemma4TextModel.init),
         "gemma4_assistant": { data in
             let fullConfig = try JSONDecoder.json5().decode(Gemma4Configuration.self, from: data)
@@ -44,11 +49,13 @@ public enum LLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
         "cohere": create(CohereConfiguration.self, CohereModel.init),
         "openelm": create(OpenElmConfiguration.self, OpenELMModel.init),
         "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
+        "deepseek_v2": create(DeepseekV2Configuration.self, DeepseekV2Model.init),
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
         "deepseek_v4": create(DeepseekV4Configuration.self, DeepseekV4Model.init),
         "granite": create(GraniteConfiguration.self, GraniteModel.init),
@@ -101,6 +108,9 @@ public enum LLMTypeRegistry {
             }
         },
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
+        "hunyuan_v1_dense": create(HunyuanConfiguration.self, HunyuanModel.init),
+        "nemotron_labs_diffusion": create(
+            NemotronLabsDiffusionConfiguration.self, NemotronLabsDiffusionModel.init),
     ])
 }
 
@@ -138,6 +148,11 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     static public let deepSeekR1_7B_4bit = ModelConfiguration(
         id: "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit",
         defaultPrompt: "Is 9.9 greater or 9.11?"
+    )
+
+    static public let falconH1R7B = ModelConfiguration(
+        id: "tiiuae/Falcon-H1R-7B",
+        defaultPrompt: "If the product of two numbers is 360 and their GCD is 6, what is their LCM?"
     )
 
     static public let phi4bit = ModelConfiguration(
@@ -238,44 +253,84 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         eosTokenIds: [0]
     )
 
+    static public let hunyuan_mt_7b_4bit = ModelConfiguration(
+        id: "mlx-community/Hunyuan-MT-7B-4bit",
+        defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
+    )
+
+    static public let hunyuan_mt_7b_8bit = ModelConfiguration(
+        id: "mlx-community/Hunyuan-MT-7B-8bit",
+        defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
+    )
+
+    static public let hy_mt2_7b_4bit = ModelConfiguration(
+        id: "mlx-community/Hy-MT2-7B-4bit",
+        defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
+    )
+
+    static public let hy_mt2_7b_8bit = ModelConfiguration(
+        id: "mlx-community/Hy-MT2-7B-8bit",
+        defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
+    )
+
     static public let qwen205b4bit = ModelConfiguration(
         id: "mlx-community/Qwen1.5-0.5B-Chat-4bit",
-        defaultPrompt: "why is the sky blue?"
+        defaultPrompt: "why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let qwen2_5_7b = ModelConfiguration(
         id: "mlx-community/Qwen2.5-7B-Instruct-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let qwen2_5_1_5b = ModelConfiguration(
         id: "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let qwen3_0_6b_4bit = ModelConfiguration(
         id: "mlx-community/Qwen3-0.6B-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let qwen3_1_7b_4bit = ModelConfiguration(
         id: "mlx-community/Qwen3-1.7B-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let qwen3_4b_4bit = ModelConfiguration(
         id: "mlx-community/Qwen3-4B-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let qwen3_8b_4bit = ModelConfiguration(
         id: "mlx-community/Qwen3-8B-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let qwen3MoE_30b_a3b_4bit = ModelConfiguration(
         id: "mlx-community/Qwen3-30B-A3B-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let qwen3_5_2b_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-2B-4bit",
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let qwen3_6_27b_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.6-27B-4bit",
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let openelm270m4bit = ModelConfiguration(
@@ -286,22 +341,26 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     static public let llama3_1_8B_4bit = ModelConfiguration(
         id: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
-        defaultPrompt: "What is the difference between a fruit and a vegetable?"
+        defaultPrompt: "What is the difference between a fruit and a vegetable?",
+        extraEOSTokens: ["<|eot_id|>"]
     )
 
     static public let llama3_8B_4bit = ModelConfiguration(
         id: "mlx-community/Meta-Llama-3-8B-Instruct-4bit",
-        defaultPrompt: "What is the difference between a fruit and a vegetable?"
+        defaultPrompt: "What is the difference between a fruit and a vegetable?",
+        extraEOSTokens: ["<|eot_id|>"]
     )
 
     static public let llama3_2_1B_4bit = ModelConfiguration(
         id: "mlx-community/Llama-3.2-1B-Instruct-4bit",
-        defaultPrompt: "What is the difference between a fruit and a vegetable?"
+        defaultPrompt: "What is the difference between a fruit and a vegetable?",
+        extraEOSTokens: ["<|eot_id|>"]
     )
 
     static public let llama3_2_3B_4bit = ModelConfiguration(
         id: "mlx-community/Llama-3.2-3B-Instruct-4bit",
-        defaultPrompt: "What is the difference between a fruit and a vegetable?"
+        defaultPrompt: "What is the difference between a fruit and a vegetable?",
+        extraEOSTokens: ["<|eot_id|>"]
     )
 
     static public let deepseek_r1_4bit = ModelConfiguration(
@@ -402,15 +461,21 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Why is the sky blue?"
     )
 
-    static public let jamba_3b = ModelConfiguration(
-        id: "mlx-community/AI21-Jamba-Reasoning-3B-bf16",
+    static public let jamba_3b_4bit = ModelConfiguration(
+        id: "mlx-community/AI21-Jamba-Reasoning-3B-4bit",
         defaultPrompt: ""
+    )
+
+    static public let nemotron_labs_diffusion_3b_4bit = ModelConfiguration(
+        id: "mlx-community/Nemotron-Labs-Diffusion-3B-4bit",
+        defaultPrompt: "Explain quaternions."
     )
 
     private static func all() -> [ModelConfiguration] {
         [
             codeLlama13b4bit,
             deepSeekR1_7B_4bit,
+            falconH1R7B,
             gemma2bQuantized,
             gemma_2_2b_it_4bit,
             gemma_2_9b_it_4bit,
@@ -443,6 +508,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3_4b_4bit,
             qwen3_8b_4bit,
             qwen3MoE_30b_a3b_4bit,
+            qwen3_5_2b_4bit,
+            qwen3_6_27b_4bit,
             smolLM_135M_4bit,
             deepseek_r1_4bit,
             mimo_7b_sft_4bit,
@@ -461,7 +528,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             lfm2_8b_a1b_3bit_mlx,
             nanochat_d20_mlx,
             gpt_oss_20b_MXFP4_Q8,
-            jamba_3b,
+            jamba_3b_4bit,
+            nemotron_labs_diffusion_3b_4bit,
         ]
     }
 
@@ -518,10 +586,12 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 public final class LLMModelFactory: ModelFactory {
 
     public init(
-        typeRegistry: ModelTypeRegistry<LanguageModel>, modelRegistry: AbstractModelRegistry
+        typeRegistry: ModelTypeRegistry<LanguageModel>, modelRegistry: AbstractModelRegistry,
+        conventionsRegistry: ChatConventionsRegistry = .shared
     ) {
         self.typeRegistry = typeRegistry
         self.modelRegistry = modelRegistry
+        self.conventionsRegistry = conventionsRegistry
     }
 
     /// Shared instance with default behavior.
@@ -533,6 +603,10 @@ public final class LLMModelFactory: ModelFactory {
 
     /// registry of model id to configuration, e.g. `mlx-community/Llama-3.2-3B-Instruct-4bit`
     public let modelRegistry: AbstractModelRegistry
+
+    /// resolvers for chat conventions that are keyed on model id rather than declared
+    /// by the model itself, e.g. DeepSeek-R1
+    public let conventionsRegistry: ChatConventionsRegistry
 
     public func _load(
         configuration: ResolvedModelConfiguration,
@@ -567,13 +641,15 @@ public final class LLMModelFactory: ModelFactory {
         }
 
         // Load EOS token IDs from config.json, with optional override from generation_config.json
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        var eosTokenIds = baseConfig.effectiveEOSTokenIds
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-        if let generationData = try? Data(contentsOf: generationConfigURL),
-            let generationConfig = try? JSONDecoder.json5().decode(
-                GenerationConfigFile.self, from: generationData),
-            let genEosIds = generationConfig.eosTokenIds?.values
-        {
+        let generationConfig: GenerationConfigFile? =
+            if let generationData = try? Data(contentsOf: generationConfigURL) {
+                try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: generationData)
+            } else {
+                nil
+            }
+        if let genEosIds = generationConfig?.eosTokenIds?.values {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
@@ -581,9 +657,22 @@ public final class LLMModelFactory: ModelFactory {
         var mutableConfiguration = configuration
         eosTokenIds.formUnion(configuration.eosTokenIds)
         mutableConfiguration.eosTokenIds = eosTokenIds
+        mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
+        // Chat conventions. Precedence: an explicit value on the configuration
+        // (registry entry or caller) wins; then a registered resolver, which sees
+        // the repo id the model cannot; then the model's own declaration.
+        let modelId = configuration.name
         if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
-                from: baseConfig.modelType, configData: configData)
+            mutableConfiguration.toolCallFormat =
+                conventionsRegistry.toolCallFormat(
+                    modelId: modelId, modelType: baseConfig.modelType)
+                ?? model.toolCallFormat
+        }
+        if mutableConfiguration.reasoningConfig == nil {
+            mutableConfiguration.reasoningConfig =
+                conventionsRegistry.reasoningConfig(
+                    modelId: modelId, modelType: baseConfig.modelType)
+                ?? model.reasoningConfig
         }
 
         // Load tokenizer and weights in parallel
@@ -614,8 +703,10 @@ public final class LLMModelFactory: ModelFactory {
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
+            stopStrings: mutableConfiguration.stopStrings,
             eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
+            toolCallFormat: mutableConfiguration.toolCallFormat,
+            reasoningConfig: mutableConfiguration.reasoningConfig)
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

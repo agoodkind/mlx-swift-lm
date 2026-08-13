@@ -78,8 +78,9 @@ class Olmo3Attention: Module {
         keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -229,16 +230,13 @@ public class Olmo3Model: Module, LLMModel, KVCacheDimensionProvider {
         weights.filter { !$0.key.contains("self_attn.rotary_emb.inv_freq") }
     }
 
-    public func newCache(parameters: GenerateParameters) -> [KVCache] {
-        var caches: [KVCache] = []
-        for layerType in args.layerTypes {
-            if layerType == "full_attention" {
-                caches.append(KVCacheSimple())
-            } else {
-                caches.append(RotatingKVCache(maxSize: args.slidingWindow))
-            }
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try args.layerTypes.map { layerType in
+            try makeHybridAttentionKVCache(
+                parameters: parameters,
+                slidingWindow: args.slidingWindow,
+                usesSlidingWindow: layerType != "full_attention")
         }
-        return caches
     }
 }
 

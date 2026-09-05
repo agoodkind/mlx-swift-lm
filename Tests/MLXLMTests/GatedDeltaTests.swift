@@ -17,16 +17,19 @@ public class GatedDeltaTests: XCTestCase {
         B: Int = 1, T: Int = 16, Hk: Int = 2, Dk: Int = 32,
         Hv: Int = 4, Dv: Int = 16, seed: UInt64 = 42
     ) -> Inputs {
-        MLXRandom.seed(seed)
-        let dtype = DType.bfloat16
-        let q = MLXRandom.normal([B, T, Hk, Dk]).asType(dtype)
-        let k = MLXRandom.normal([B, T, Hk, Dk]).asType(dtype)
-        let v = MLXRandom.normal([B, T, Hv, Dv]).asType(dtype)
-        let a = MLXRandom.normal([B, T, Hv]).asType(dtype)
-        let b = MLXRandom.normal([B, T, Hv]).asType(dtype)
-        let aLog = (MLXRandom.normal([Hv]) * MLXArray(0.1)).asType(dtype)
-        let dtBias = MLXRandom.normal([Hv]).asType(dtype)
-        return Inputs(q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias)
+        // Task-local rather than MLXRandom.seed: parallel tests must not
+        // share (or perturb) the global random stream.
+        withRandomState(MLXRandom.RandomState(seed: seed)) {
+            let dtype = DType.bfloat16
+            let q = MLXRandom.normal([B, T, Hk, Dk]).asType(dtype)
+            let k = MLXRandom.normal([B, T, Hk, Dk]).asType(dtype)
+            let v = MLXRandom.normal([B, T, Hv, Dv]).asType(dtype)
+            let a = MLXRandom.normal([B, T, Hv]).asType(dtype)
+            let b = MLXRandom.normal([B, T, Hv]).asType(dtype)
+            let aLog = (MLXRandom.normal([Hv]) * MLXArray(0.1)).asType(dtype)
+            let dtBias = MLXRandom.normal([Hv]).asType(dtype)
+            return Inputs(q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias)
+        }
     }
 
     /// Multi-chunk prefill must match single-chunk prefill at the same total T.
@@ -97,8 +100,8 @@ public class GatedDeltaTests: XCTestCase {
         )
 
         // Perturb only the trailing dims the truncating kernel would drop.
-        var qP = inputs.q
-        var kP = inputs.k
+        let qP = inputs.q
+        let kP = inputs.k
         qP[0..., 0..., 0..., 32...] = qP[0..., 0..., 0..., 32...] + MLXArray(1).asType(.bfloat16)
         kP[0..., 0..., 0..., 32...] = kP[0..., 0..., 0..., 32...] + MLXArray(1).asType(.bfloat16)
 

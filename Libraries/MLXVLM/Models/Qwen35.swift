@@ -227,7 +227,7 @@ public struct Qwen35Configuration: Codable, Sendable {
 
 // MARK: - Language
 
-enum Qwen35Language {
+public enum Qwen35Language {
 
     final class RotaryEmbedding {
         private let invFreq: MLXArray
@@ -472,7 +472,7 @@ enum Qwen35Language {
         }
     }
 
-    final class GatedDeltaNet: Module {
+    open class GatedDeltaNet: Module {
         let hiddenSize: Int
         let numVHeads: Int
         let numKHeads: Int
@@ -489,13 +489,18 @@ enum Qwen35Language {
         @ModuleInfo(key: "in_proj_b") var inProjB: Linear
         @ModuleInfo(key: "in_proj_a") var inProjA: Linear
 
+        // Inference-only physical projection. The four registered modules
+        // remain as views so checkpoint and adapter paths stay unchanged.
+        private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
+        var fusedInputProjectionEnabled = qwen35FourGDNEnabled
+
         @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
         @ParameterInfo(key: "A_log") var aLog: MLXArray
 
         @ModuleInfo(key: "norm") var norm: RMSNormGated
         @ModuleInfo(key: "out_proj") var outProj: Linear
 
-        init(_ args: Qwen35Configuration.TextConfiguration) {
+        public init(_ args: Qwen35Configuration.TextConfiguration) {
             self.hiddenSize = args.hiddenSize
             self.numVHeads = args.linearNumValueHeads
             self.numKHeads = args.linearNumKeyHeads
@@ -536,7 +541,85 @@ enum Qwen35Language {
             super.init()
         }
 
-        func callAsFunction(
+        @discardableResult
+        open override func update(
+            parameters: ModuleParameters, verify: VerifyUpdate,
+            path: [String] = [], modulePath: [String] = []
+        ) throws -> Self {
+            let inputProjectionPrefixes = [
+                "in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a.",
+            ]
+            let replacesInputProjection = parameters.flattened().contains { key, _ in
+                inputProjectionPrefixes.contains(where: key.hasPrefix)
+            }
+            defer {
+                if replacesInputProjection {
+                    fusedInputProjection.invalidate()
+                }
+            }
+            return try super.update(
+                parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        }
+
+        open override func updateModule(key: String, _ value: Any) throws {
+            let replacesInputProjection =
+                key == "in_proj_qkv" || key == "in_proj_z"
+                || key == "in_proj_b" || key == "in_proj_a"
+            defer {
+                if replacesInputProjection {
+                    fusedInputProjection.invalidate()
+                }
+            }
+            try super.updateModule(key: key, value)
+        }
+
+        var hasFusedInputProjection: Bool { fusedInputProjection.isPrepared }
+
+        @discardableResult
+        func prepareFusedInputProjection() throws -> Bool {
+            try fusedInputProjection.prepare(
+                enabled: fusedInputProjectionEnabled,
+                linears: [
+                    inProjQKV, inProjZ, inProjB, inProjA,
+                ]
+            ) { sourceViews in
+                try update(
+                    modules: ModuleChildren(values: [
+                        "in_proj_qkv": .value(sourceViews[0]),
+                        "in_proj_z": .value(sourceViews[1]),
+                        "in_proj_b": .value(sourceViews[2]),
+                        "in_proj_a": .value(sourceViews[3]),
+                    ]), verify: [])
+            }
+        }
+
+        func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
+            qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+        ) {
+            guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
+                return (
+                    inProjQKV(inputs),
+                    inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),
+                    inProjB(inputs),
+                    inProjA(inputs)
+                )
+            }
+
+            let projected = fusedInProj(inputs)
+            let qkvEnd = keyDim * 2 + valueDim
+            let zEnd = qkvEnd + valueDim
+            let bEnd = zEnd + numVHeads
+            let aEnd = bEnd + numVHeads
+            return (
+                projected[0..., 0..., ..<qkvEnd],
+                projected[0..., 0..., qkvEnd ..< zEnd].reshaped(
+                    batch, sequence, numVHeads, headVDim),
+                projected[0..., 0..., zEnd ..< bEnd],
+                projected[0..., 0..., bEnd ..< aEnd]
+            )
+        }
+
+        open func callAsFunction(
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
             cache: MambaCache? = nil,
@@ -545,10 +628,8 @@ enum Qwen35Language {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
 
-            var mixedQKV = inProjQKV(inputs)
-            let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-            let b = inProjB(inputs)
-            let a = inProjA(inputs)
+            var (mixedQKV, z, b, a) = projectInputs(
+                inputs, batch: B, sequence: S)
 
             let convState: MLXArray
             if let cacheState = cache?[0] {
@@ -648,7 +729,7 @@ enum Qwen35Language {
         }
     }
 
-    final class SparseMoeBlock: Module, UnaryLayer {
+    open class SparseMoeBlock: Module, UnaryLayer {
         let normTopkProb: Bool
         let numExperts: Int
         let topK: Int
@@ -659,7 +740,7 @@ enum Qwen35Language {
         @ModuleInfo(key: "shared_expert") var sharedExpert: MLP
         @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-        init(_ args: Qwen35Configuration.TextConfiguration) {
+        public init(_ args: Qwen35Configuration.TextConfiguration) {
             self.normTopkProb = args.normTopkProb
             self.numExperts = args.numExperts
             self.topK = args.numExpertsPerTok
@@ -679,16 +760,12 @@ enum Qwen35Language {
             super.init()
         }
 
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
+        open func callAsFunction(_ x: MLXArray) -> MLXArray {
             var gates = gate(x)
             gates = MLX.softmax(gates, axis: -1, precise: true)
 
-            let kth = gates.dim(-1) - topK
-            let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
-            var scores = MLX.takeAlong(gates, inds, axis: -1)
-            if normTopkProb {
-                scores = scores / scores.sum(axis: -1, keepDims: true)
-            }
+            let (inds, scores) = moeRouterTopK(
+                gates, k: topK, normalize: normTopkProb)
 
             let y = switchMLP(x, inds)
             let combined = weightedExpertSum(y, scores)
@@ -700,7 +777,7 @@ enum Qwen35Language {
         }
     }
 
-    final class DecoderLayer: Module {
+    open class DecoderLayer: Module {
         let isLinear: Bool
 
         @ModuleInfo(key: "self_attn") var selfAttn: Attention?
@@ -711,7 +788,7 @@ enum Qwen35Language {
 
         @ModuleInfo(key: "mlp") var mlp: Module
 
-        init(
+        public init(
             _ args: Qwen35Configuration.TextConfiguration, layerIdx: Int,
             forceFullAttention: Bool = false
         ) {
@@ -740,7 +817,7 @@ enum Qwen35Language {
             super.init()
         }
 
-        func callAsFunction(
+        open func callAsFunction(
             _ x: MLXArray,
             attentionMask: MLXArray?,
             ssmMask: MLXArray?,
@@ -792,7 +869,7 @@ enum Qwen35Language {
             super.init()
         }
 
-        func callAsFunction(
+        open func callAsFunction(
             _ inputs: MLXArray,
             inputsEmbeds: MLXArray? = nil,
             cache: [KVCache?]? = nil,
@@ -994,6 +1071,14 @@ enum Qwen35Language {
                 return KVCacheSimple()
             }
         }
+
+        func prepare() throws {
+            for layer in model.layers {
+                if let linearAttn = layer.linearAttn {
+                    _ = try linearAttn.prepareFusedInputProjection()
+                }
+            }
+        }
     }
 }
 
@@ -1050,6 +1135,10 @@ public class Qwen35: Module, VLMModel {
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         languageModel.makeCache(capacity: try parameters?.effectiveKVCacheCapacity())
+    }
+
+    public func prepare() throws {
+        try languageModel.prepare()
     }
 
     private func mergeInputIdsWithImageFeatures(
@@ -1361,9 +1450,9 @@ public class Qwen35: Module, VLMModel {
             weights = weights.filter { !$0.key.contains("mtp.") }
         }
 
-        if config.textConfiguration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
+        weights = filterLMHeadWeights(
+            from: weights,
+            tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
 
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count)
@@ -1436,6 +1525,6 @@ extension Qwen35 {
 
 // `Qwen35MoE` subclasses `Qwen35` and inherits both declarations.
 extension Qwen35 {
-    public var toolCallFormat: ToolCallFormat? { .xmlFunction }
+    public var toolCallFormat: ToolCallFormat? { .qwen35 }
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }

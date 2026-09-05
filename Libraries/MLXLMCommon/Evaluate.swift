@@ -41,6 +41,31 @@ public protocol LogitProcessor {
 
     /// Called to provide the sampled token
     mutating func didSample(token: MLXArray)
+
+    /// Returns an independent copy of this processor.
+    ///
+    /// Value types (structs) obtain an independent copy via standard value semantics
+    /// by default. Reference types (classes) must explicitly implement this method to
+    /// produce a distinct instance; classes that do not provide an implementation trap.
+    func copy() -> Self
+}
+
+extension LogitProcessor {
+    public func copy() -> Self {
+        self
+    }
+}
+
+extension LogitProcessor where Self: AnyObject {
+    public func copy() -> Self {
+        fatalError(
+            """
+            \(Self.self) is a reference type conforming to LogitProcessor but does not implement copy(). \
+            Reference-type processors must explicitly implement copy() to support isolated state scoping \
+            in speculative decoding and verification passes.
+            """
+        )
+    }
 }
 
 /// Parameters for text generation, see ``TokenIterator``.
@@ -112,6 +137,12 @@ public struct GenerateParameters: Sendable {
     /// - "turbo4"/"turbo4v2"/"turbo3"/"turbo2"  turbo-quantized keys:
     ///   maximum compression; K sensitivity varies by model family, so
     ///   validate on your model (asym is the recommended starting point).
+    ///
+    /// Variance-normalized (KVarN-inspired) schemes for memory-bound long context:
+    /// - "varn" / "varn4v2"  4-bit K + 2-bit V, 128-token tiles
+    /// - "varn4" / "varn4v4"  4-bit K/V
+    /// - "varn2" / "varn2v2"  2-bit K/V
+    /// - "varn4v2t32" / "varn4v2t64"  explicit tile size variants
     ///
     /// Unrecognized schemes are rejected when generation starts. Prefer
     /// ``kvCache`` for compile-time-safe configuration.
@@ -612,6 +643,10 @@ public struct ChainedLogitProcessor: LogitProcessor {
 
     public init(processors: [any LogitProcessor]) {
         self.processors = processors
+    }
+
+    public func copy() -> Self {
+        Self(processors: processors.map { $0.copy() })
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
@@ -1157,7 +1192,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         // Draft generation: autoregressive loop with draft model
-        var draftProcessor = processor  // Copy to discard later
+        var draftProcessor = processor?.copy()  // Copy to discard later
         var draftTokens = [MLXArray]()
         var draftProcessedLogits = [MLXArray]()
         for _ in 0 ..< numDraft {
@@ -2070,9 +2105,10 @@ public func generate(
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination across
 ///     concurrent tasks. This is opt-in and only applied on GPU devices that support wired
 ///     memory control (macOS 15 / iOS 18 / tvOS 18 or newer).
-///   - tools: Optional tool schemas used to parse tool-call arguments into their declared types.
+///   - tools: Optional tool schemas used to parse tool-call arguments and authorize function names.
 /// - Returns: An `AsyncStream` that emits `Generation` values, including generated text chunks (`.chunk`),
-///   tool calls (`.toolCall`), and completion information (`.info`).
+///   accepted tool calls (`.toolCall`), rejected tool-call attempts (`.rejectedToolCall`), and
+///   completion information (`.info`).
 /// - Throws: An error if the `TokenIterator` initialization fails due to invalid input or model configuration.
 ///
 /// ### Example Usage:
@@ -2096,6 +2132,8 @@ public func generate(
 ///         print("Finished: \(info.tokensPerSecond) tokens/s.")
 ///     case .toolCall(let call):
 ///         print("Tool call: \(call.function.name)")
+///     case .rejectedToolCall(let rejection):
+///         print("Rejected tool call: \(rejection.reason)")
 ///     }
 /// }
 /// ```
@@ -2149,6 +2187,8 @@ public func generate(
 ///         print("Finished: \(info.tokensPerSecond) tokens/s.")
 ///     case .toolCall(let call):
 ///         print("Tool call: \(call.function.name)")
+///     case .rejectedToolCall(let rejection):
+///         print("Rejected tool call: \(rejection.reason)")
 ///     }
 /// }
 /// ```
@@ -2167,7 +2207,8 @@ public func generate(
 ///   - numDraftTokens: Number of tokens the draft model proposes per round (default: 2).
 ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
-/// - Returns: An `AsyncStream` that emits `Generation` values.
+/// - Returns: An `AsyncStream` that emits text, accepted or rejected tool calls, and completion
+///   information as `Generation` values.
 /// - Throws: An error if the iterator initialization fails.
 public func generate(
     input: LMInput,
@@ -2893,8 +2934,20 @@ public enum GenerateStopReason: Sendable {
 ///
 /// Provides information about the number of tokens processed during both the prompt and generation phases, as well as the time taken for each phase.
 public struct GenerateCompletionInfo: Sendable {
-    /// The number of tokens included in the input prompt.
+    /// The number of prompt tokens actually prefilled during this generation.
+    ///
+    /// When a session reuses a KV-cache prefix only the remaining suffix is fed
+    /// to the model, so this counts fewer tokens than the rendered prompt. See
+    /// ``cachedPromptTokenCount`` and ``totalPromptTokenCount``.
     public let promptTokenCount: Int
+
+    /// The number of prompt tokens served by a reused KV-cache prefix instead
+    /// of being prefilled, or `0` when the whole prompt was prefilled.
+    ///
+    /// Only a cache-owning caller can know this: the generation loop receives
+    /// an already narrowed prompt and has no notion of a prompt cache.
+    /// ``ChatSession`` attributes it from its cache reuse decision.
+    public internal(set) var cachedPromptTokenCount: Int
 
     /// The number of tokens generated by the language model.
     public let generationTokenCount: Int
@@ -2914,6 +2967,20 @@ public struct GenerateCompletionInfo: Sendable {
     /// Total number of draft tokens evaluated (if speculative decoding is active).
     public let totalDraftTokens: Int
 
+    /// Number of tool-call-shaped outputs rejected during this generation.
+    public let rejectedToolCallCount: Int
+
+    /// The rendered prompt length: the reused cache prefix plus the prefilled tokens.
+    public var totalPromptTokenCount: Int {
+        cachedPromptTokenCount + promptTokenCount
+    }
+
+    /// Fraction of the prompt served from cache, in `0...1`.
+    public var cacheEfficiency: Double {
+        let total = totalPromptTokenCount
+        return total > 0 ? Double(cachedPromptTokenCount) / Double(total) : 0
+    }
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -2926,6 +2993,7 @@ public struct GenerateCompletionInfo: Sendable {
 
     public init(
         promptTokenCount: Int,
+        cachedPromptTokenCount: Int = 0,
         generationTokenCount: Int,
         promptTime: TimeInterval,
         generationTime: TimeInterval,
@@ -2934,6 +3002,7 @@ public struct GenerateCompletionInfo: Sendable {
         totalDraftTokens: Int = 0
     ) {
         self.promptTokenCount = promptTokenCount
+        self.cachedPromptTokenCount = cachedPromptTokenCount
         self.generationTokenCount = generationTokenCount
         self.promptTime = promptTime
         self.generateTime = generationTime
@@ -2943,10 +3012,31 @@ public struct GenerateCompletionInfo: Sendable {
     }
 
     public func summary() -> String {
-        """
-        Prompt:     \(promptTokenCount) tokens, \(promptTokensPerSecond.formatted()) tokens/s, \(promptTime.formatted())s
-        Generation: \(generationTokenCount) tokens, \(tokensPerSecond.formatted()) tokens/s, \(generateTime.formatted())s
-        """
+        var lines = [
+            "Prompt:     \(promptTokenCount) tokens, \(promptTokensPerSecond.formatted()) tokens/s, \(promptTime.formatted())s",
+            "Generation: \(generationTokenCount) tokens, \(tokensPerSecond.formatted()) tokens/s, \(generateTime.formatted())s",
+        ]
+        if cachedPromptTokenCount > 0 {
+            lines.append(
+                "Cache:      \(cachedPromptTokenCount)/\(totalPromptTokenCount) prompt tokens reused, \(cacheEfficiency.formatted(.percent.precision(.fractionLength(0)))) efficiency"
+            )
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    fileprivate func withRejectedToolCallCount(_ count: Int) -> Self {
+        Self(
+            promptTokenCount: promptTokenCount,
+            cachedPromptTokenCount: cachedPromptTokenCount,
+            generationTokenCount: generationTokenCount,
+            promptTime: promptTime,
+            generationTime: generateTime,
+            stopReason: stopReason,
+            proposedDraftTokens: proposedDraftTokens,
+            acceptedDraftTokens: acceptedDraftTokens,
+            passthroughReason: passthroughReason,
+            speculativeDecodingTelemetry: speculativeDecodingTelemetry,
+            rejectedToolCallCount: count)
     }
 }
 
@@ -2955,6 +3045,7 @@ public struct GenerateCompletionInfo: Sendable {
 /// This enum distinguishes between the following:
 /// - `.chunk`: A decoded string from one or more tokens generated by the language model, along with the token ID.
 /// - `.toolCall`: A tool call parsed from the generated output.
+/// - `.rejectedToolCall`: Tool-call-shaped output that was not executable.
 /// - `.info`: Metadata and performance statistics about the generation process.
 public enum Generation: Sendable {
     /// A generated text chunk as a String, paired with the raw token ID that produced it.
@@ -2968,12 +3059,16 @@ public enum Generation: Sendable {
     /// A tool call from the language model.
     case toolCall(ToolCall)
 
+    /// A tool-call-shaped model output rejected by parsing or authorization.
+    case rejectedToolCall(RejectedToolCall)
+
     /// Generated text or nil
     public var chunk: String? {
         switch self {
         case .chunk(let string, _, _): string
         case .info: nil
         case .toolCall: nil
+        case .rejectedToolCall: nil
         }
     }
 
@@ -2983,6 +3078,7 @@ public enum Generation: Sendable {
         case .chunk(_, _, _): nil
         case .info(let info): info
         case .toolCall: nil
+        case .rejectedToolCall: nil
         }
     }
 
@@ -2992,6 +3088,17 @@ public enum Generation: Sendable {
         case .chunk: nil
         case .info: nil
         case .toolCall(let toolCall): toolCall
+        case .rejectedToolCall: nil
+        }
+    }
+
+    /// Rejected tool call or nil.
+    public var rejectedToolCall: RejectedToolCall? {
+        switch self {
+        case .chunk: nil
+        case .info: nil
+        case .toolCall: nil
+        case .rejectedToolCall(let rejection): rejection
         }
     }
 
@@ -2999,6 +3106,17 @@ public enum Generation: Sendable {
     @Sendable
     public static func collect(_ batch: [Generation]?, _ element: Generation) -> [Generation] {
         (batch ?? []) + [element]
+    }
+
+    /// Attributes `count` prompt tokens to a reused KV-cache prefix on a `.info`
+    /// payload; every other case passes through unchanged.
+    ///
+    /// The generation loop is handed an already narrowed prompt, so only the
+    /// cache owner can supply this. See ``GenerateCompletionInfo/cachedPromptTokenCount``.
+    func attributingCachedPromptTokens(_ count: Int) -> Generation {
+        guard count > 0, case .info(var info) = self else { return self }
+        info.cachedPromptTokenCount = count
+        return .info(info)
     }
 }
 
@@ -3154,7 +3272,7 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
     }
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
-        .info(info)
+        .info(info.withRejectedToolCallCount(decoder.rejectedToolCallCount))
     }
 
     private mutating func process(
@@ -3200,6 +3318,12 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
 
         case .protocolError(let message):
             Self.logger.error("\(message)")
+            return .more
+
+        case .rejectedToolCall(let rejection):
+            if case .terminated = emit(.rejectedToolCall(rejection)) {
+                return .cancelled
+            }
             return .more
 
         case .stop:

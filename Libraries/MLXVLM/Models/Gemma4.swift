@@ -1231,7 +1231,6 @@ private final class Gemma4TextBackbone: Module, LayerPartitionable, StreamableMo
         }
         let finalPerLayerInputs = projectPerLayerInputs(h0, perLayerInputs: processedPerLayerInputs)
 
-        let hasExplicitCache = cache != nil
         let localCache =
             cache ?? Array(repeating: nil as KVCache?, count: max(firstKVSharedLayerIdx, 1))
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode
@@ -2342,18 +2341,22 @@ public struct Gemma4Processor: UserInputProcessor {
         var frameCounts: [Int] = []
         for video in videos {
             let sequence = try await MediaProcessing.asProcessedSequence(
-                video, targetFPS: { _ in 1.0 }, maxFrames: config.videoMaxFrames
+                video,
+                processing: processing?.video ?? .init(),
+                targetFPS: { _ in 1.0 },
+                maxFrames: config.videoMaxFrames
             ) { frame in
                 var userProcessing = processing ?? UserInput.Processing()
                 userProcessing.resize = targetSize
-                var image = MediaProcessing.apply(frame.frame, processing: userProcessing)
+                var image = MediaProcessing.apply(
+                    try frame.image.asCIImage(), processing: userProcessing)
                 image = MediaProcessing.inSRGBToneCurveSpace(image)
                 image = MediaProcessing.resampleBicubic(image, to: targetSize)
                 if config.doNormalize {
                     image = MediaProcessing.normalize(
                         image, mean: config.imageMeanTuple, std: config.imageStdTuple)
                 }
-                return VideoFrame(frame: image, timeStamp: frame.timeStamp)
+                return VideoFrame(image: .ciImage(image), timeStamp: frame.timeStamp)
             }
             allFrames.append(contentsOf: sequence.frames)
             frameCounts.append(sequence.frames.count)

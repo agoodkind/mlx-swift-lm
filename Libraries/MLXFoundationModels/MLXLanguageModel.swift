@@ -562,7 +562,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         load: @escaping ContainerLoader
     ) {
         self.configuration = configuration
-        self.capabilities = LanguageModelCapabilities(capabilities: capabilities)
+        self.capabilities = LanguageModelCapabilities(capabilities)
         self.configurationResolver = configurationResolver
         self.weightsLocation = weightsLocation
         self.load = load
@@ -683,7 +683,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             enum Destination: Sendable { case response, reasoning }
             case appendText(String, entryID: String?, destination: Destination)
             case toolCall(id: String, name: String, arguments: String)
-            case updateMetadata([String: any Sendable & Codable & Equatable], entryID: String?)
+            case updateMetadata(
+                [String: any ConvertibleToGeneratedContent & Sendable], entryID: String?)
             case updateUsage(
                 input: LanguageModelExecutorGenerationChannel.Usage.Input,
                 output: LanguageModelExecutorGenerationChannel.Usage.Output,
@@ -711,7 +712,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         }
 
         static func emitMetadata(
-            _ values: [String: any Sendable & Codable & Equatable], entryID: String?,
+            _ values: [String: any ConvertibleToGeneratedContent & Sendable], entryID: String?,
             into channel: LanguageModelExecutorGenerationChannel
         ) async {
             generationObserver?(.updateMetadata(values, entryID: entryID))
@@ -725,39 +726,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             into channel: LanguageModelExecutorGenerationChannel
         ) async {
             generationObserver?(.updateUsage(input: input, output: output, entryID: entryID))
-
-            // TODO: papering over an FM-27 SDK symbol drift -- restore
-            // the channel usage send (the commented-out call at the end of this
-            // block) once the shipping dylib matches its own interface.
-            //
-            // Usage is intentionally NOT forwarded to the FoundationModels
-            // channel on this SDK. The FM-27 beta `.swiftinterface` declares
-            //   Response.Action.updateUsage(input:output:metadata: = [:])
-            // (three parameters), but the shipping FoundationModels dylib only
-            // exports the older two-parameter
-            //   Response.Action.updateUsage(input:output:)
-            // Because our call relies on the `metadata:` default, the compiler
-            // resolves it to the three-parameter symbol, which does not exist
-            // at runtime. dyld cannot bind it: under chained-fixups linking
-            // (the arm64 default) the reference aborts the process the moment
-            // the image loads, and under lazy binding it faults through null
-            // (SIGSEGV at 0x0) the instant this send executes -- crashing every
-            // `respond()` path right after generation completes.
-            //
-            // A runtime `dlsym` guard cannot save this: the compiled reference
-            // to the missing symbol is enough to abort at launch regardless of
-            // any surrounding check. The only safe option is to not reference
-            // the symbol at all, so no `channel.send(.updateUsage(...))` here.
-            //
-            // Effect: the framework does not receive our per-response usage
-            // event, so consumer-visible usage for these responses may be
-            // absent or zero. Tests still observe usage through
-            // `generationObserver` above. When a later SDK ships a dylib that
-            // matches its interface, restore the send:
-            //   await channel.send(
-            //       .response(
-            //           entryID: entryID,
-            //           action: .updateUsage(input: input, output: output)))
+            await channel.send(
+                .response(entryID: entryID, action: .updateUsage(input: input, output: output)))
         }
 
         static func emitToolCall(
@@ -1477,6 +1447,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         private struct AllowedToolGenerationResult {
             var responseText = ""
             var toolCalls: [MLXLMCommon.ToolCall] = []
+            var rejectedToolCalls: [RejectedToolCall] = []
             var completionInfo: GenerateCompletionInfo?
             var reasoningTokenCount = 0
             var endedInsideReasoning = false
@@ -1594,6 +1565,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     destination: .reasoning,
                     into: channel)
             }
+            if let rejection = result.rejectedToolCalls.first {
+                throw RejectedToolCallError(rejection)
+            }
             return result
         }
 
@@ -1606,10 +1580,27 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             case .reasoning(let text): reasoningText += text
             case .response(let text): result.responseText += text
             case .toolCall(let call): result.toolCalls.append(call)
+            case .rejectedToolCall(let rejection): result.rejectedToolCalls.append(rejection)
             case .protocolError(let message): Self.protocolLogger.error("\(message)")
             case .stop: return false
             }
             return true
+        }
+
+        /// Reports a rejected tool call seen on the plain/reasoning streaming path.
+        ///
+        /// That path builds its decoder with `tools: nil`, so a rejection there is a
+        /// protocol anomaly rather than a call the caller could have executed. The
+        /// allowed-tool path treats a rejection as significant and throws
+        /// ``RejectedToolCallError``, but the decoder closures on this path are
+        /// non-throwing, so route the event to the same log channel as
+        /// `.protocolError` instead of dropping it silently. `rawTextPreview` is
+        /// deliberately never logged: it can carry raw model output and argument
+        /// values.
+        private static func logRejectedToolCall(_ rejection: RejectedToolCall) {
+            let toolName = rejection.toolName ?? "<unknown>"
+            protocolLogger.error(
+                "rejected tool call: reason=\(rejection.reason.rawValue) tool=\(toolName)")
         }
 
         private func consumeAllowedEvents(
@@ -1625,6 +1616,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     result.responseText += text
                 case .toolCall(let call):
                     result.toolCalls.append(call)
+                case .rejectedToolCall(let rejection):
+                    result.rejectedToolCalls.append(rejection)
                 }
             }
             return reasoningChunks
@@ -1638,8 +1631,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             guard let info = result.completionInfo else { return }
             await Self.emitUsage(
                 input: .init(
-                    totalTokenCount: info.promptTokenCount,
-                    cachedTokenCount: 0),
+                    totalTokenCount: info.totalPromptTokenCount,
+                    cachedTokenCount: info.cachedPromptTokenCount),
                 output: .init(
                     totalTokenCount: info.generationTokenCount,
                     reasoningTokenCount: min(
@@ -1773,17 +1766,22 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         text: text, entryID: entryID, destination: .response, into: channel)
                 case .info(let info):
                     // MLX-LM emits one .info event at end-of-generation with
-                    // authoritative scalar token counts (`promptTokenCount`
-                    // is the prompt; `generationTokenCount` is the
-                    // model-generated completion -- see Evaluate.swift's
+                    // authoritative scalar token counts (`totalPromptTokenCount`
+                    // is the rendered prompt, of which `cachedPromptTokenCount`
+                    // came from a reused KV-cache prefix; `generationTokenCount`
+                    // is the model-generated completion -- see Evaluate.swift's
                     // `GenerateCompletionInfo` definition).
                     await Self.emitUsage(
-                        input: .init(totalTokenCount: info.promptTokenCount, cachedTokenCount: 0),
+                        input: .init(
+                            totalTokenCount: info.totalPromptTokenCount,
+                            cachedTokenCount: info.cachedPromptTokenCount),
                         output: .init(
                             totalTokenCount: info.generationTokenCount, reasoningTokenCount: 0),
                         entryID: entryID, into: channel)
                 case .toolCall(_):
                     break
+                case .rejectedToolCall(let rejection):
+                    throw RejectedToolCallError(rejection)
                 }
             }
         }
@@ -1882,6 +1880,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                 case .reasoning(let text): segments.append(.reasoning(text))
                                 case .response(let text): segments.append(.response(text))
                                 case .toolCall: break
+                                case .rejectedToolCall(let rejection):
+                                    Self.logRejectedToolCall(rejection)
                                 case .protocolError(let message):
                                     Self.protocolLogger.error("\(message)")
                                 case .stop: shouldContinue = false
@@ -1935,6 +1935,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     case .reasoning(let text): segments.append(.reasoning(text))
                     case .response(let text): segments.append(.response(text))
                     case .toolCall, .stop: break
+                    case .rejectedToolCall(let rejection):
+                        Self.logRejectedToolCall(rejection)
                     case .protocolError(let message):
                         Self.protocolLogger.error("\(message)")
                     }
@@ -1971,7 +1973,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 // so we must not also rely on per-delta auto-summing). The
                 // reasoning count is clamped to never exceed the total.
                 await Self.emitUsage(
-                    input: .init(totalTokenCount: info.promptTokenCount, cachedTokenCount: 0),
+                    input: .init(
+                        totalTokenCount: info.totalPromptTokenCount,
+                        cachedTokenCount: info.cachedPromptTokenCount),
                     output: .init(
                         totalTokenCount: info.generationTokenCount,
                         reasoningTokenCount: min(reasoningTokenCount, info.generationTokenCount)),

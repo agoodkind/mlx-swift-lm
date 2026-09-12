@@ -180,6 +180,23 @@ public protocol QuantizedKVCacheProtocol: KVCache {
     func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
 }
 
+/// Protocol for caches that can update and compute attention from their own storage layout.
+///
+/// Used by compressed caches such as ``VarianceNormalizedKVCache`` that keep completed
+/// tiles in a non-materialized representation and compute scores/values via cache-native
+/// kernels (e.g. `quantizedMM` in a rotated domain).
+public protocol KVCacheAttentionProtocol: KVCache {
+    /// Update the cache with new K/V tensors and compute attention without first returning a
+    /// fully materialized cache tensor pair.
+    func updateAndAttend(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray
+}
+
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
@@ -692,6 +709,17 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
+    /// In ring layout all rows are live, with `idx...` preceding `keep ..< idx`.
+    /// At the end of the buffer the ring is already in temporal order. Otherwise,
+    /// temporal layout holds only the first `idx` rows, even when `offset` is larger.
+    /// `nil` defers legacy inference until arrays and metadata have both been restored.
+    /// Every write or trim resolves it before changing either buffers or counters.
+    private var wrappedFlag: Bool? = false
+
+    private var wrapped: Bool {
+        wrappedFlag ?? (idx < (keys?.dim(2) ?? 0) && offset > idx)
+    }
+
     /// Model-native sliding-window caches deliberately keep their architectural
     /// window and do not participate in requested-capacity validation.
     package var capacityOrigin = CapacityOrigin.modelNative
@@ -734,7 +762,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         // Rearrange the cache into temporal order, slicing off the end if unused
         if idx == array.dim(2) {
             return array
-        } else if idx < offset {
+        } else if wrapped {
             return concatenated(
                 [
                     array[.ellipsis, ..<keep, 0...],
@@ -818,6 +846,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
         offset += keys.dim(2)
         idx = self.keys!.dim(2)
+        wrappedFlag = false
 
         return (self.keys!, self.values!)
     }
@@ -828,13 +857,13 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let S = keys.dim(2)
         let kHeadDim = keys.dim(3)
         let vHeadDim = values.dim(3)
-        let prev = offset
 
-        // May not have hit the max size yet, so potentially keep growing the cache
-        if self.keys == nil
-            || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
-        {
-            let newSize = min(step, maxCacheSize - prev)
+        // May not have hit the max size yet, so potentially keep growing the cache.
+        // Fill is tracked by `idx`, not `offset`: after a post-wrap trim the logical
+        // offset exceeds the rows actually held, and growth must resume from the rows.
+        let filled = self.keys?.dim(2) ?? 0
+        if self.keys == nil || (!wrapped && idx >= filled && filled < maxCacheSize) {
+            let newSize = min(step, maxCacheSize - filled)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
             let vShape = [B, nKVHeads, newSize, vHeadDim]
@@ -848,7 +877,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 self.keys = newK
                 self.values = newV
             }
-            idx = prev
         }
 
         // Trim if needed
@@ -862,6 +890,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         // Rotate if we've hit the end
         if idx == maxCacheSize {
             idx = keep
+            wrappedFlag = true
         }
 
         // Assign
@@ -870,17 +899,19 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         offset += S
         idx += S
 
-        // Return the appropriate cache slice
-        if offset < maxCacheSize {
+        // Return the appropriate cache slice: live rows are bounded by `idx` in
+        // temporal layout, while a wrapped ring is fully live.
+        if !wrapped, idx < self.keys!.dim(2) {
             return (
-                self.keys![.ellipsis, ..<offset, 0...],
-                self.values![.ellipsis, ..<offset, 0...]
+                self.keys![.ellipsis, ..<idx, 0...],
+                self.values![.ellipsis, ..<idx, 0...]
             )
         }
         return (self.keys!, self.values!)
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        wrappedFlag = wrapped
         let result =
             if keys.dim(2) == 1 {
                 updateInPlace(keys: keys, values: values)
@@ -893,10 +924,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     public override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }
-            if offset < keys.dim(2) {
+            if !wrapped, idx < keys.dim(2) {
                 return [
-                    keys[.ellipsis, ..<offset, 0...],
-                    values[.ellipsis, ..<offset, 0...],
+                    keys[.ellipsis, ..<idx, 0...],
+                    values[.ellipsis, ..<idx, 0...],
                 ]
             } else {
                 return [keys, values]
@@ -922,12 +953,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         get {
             return [
                 String(keep), String(maxCacheSize), String(step), String(offset), String(idx),
-                capacityOrigin.rawValue,
+                capacityOrigin.rawValue, String(wrapped),
             ]
         }
         set {
-            guard newValue.count == 5 || newValue.count == 6 else {
-                fatalError("RotatingKVCache metaState must have 5 or 6 values")
+            guard (5 ... 7).contains(newValue.count) else {
+                fatalError("RotatingKVCache metaState must have 5 to 7 values")
             }
             guard let keepVal = Int(newValue[0]),
                 let stepVal = Int(newValue[2]),
@@ -949,13 +980,23 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             self.step = stepVal
             self.offset = offsetVal
             self.idx = idxVal
-            if newValue.count == 6 {
+            if newValue.count >= 6 {
                 guard let origin = CapacityOrigin(rawValue: newValue[5]) else {
                     fatalError("Invalid RotatingKVCache capacity origin '\(newValue[5])'")
                 }
                 self.capacityOrigin = origin
             } else {
                 self.capacityOrigin = .modelNative
+            }
+            if newValue.count == 7 {
+                guard let wrappedValue = Bool(newValue[6]) else {
+                    fatalError("Invalid RotatingKVCache wrapped flag '\(newValue[6])'")
+                }
+                self.wrappedFlag = wrappedValue
+            } else {
+                // Either setter may run first. Defer inference until the restored
+                // arrays are available, then freeze the layout before any mutation.
+                self.wrappedFlag = nil
             }
         }
     }
@@ -965,12 +1006,44 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func isTrimmable(after positions: Int) -> Bool {
+        // This is the *exact rewind* predicate: past the window a trim is merely
+        // consistent (see `trim`), because rows the rewound writes overwrote are
+        // gone. Consumers that must undo writes exactly -- the staged-round and
+        // prompt-cache-reuse machinery -- key off this and fall back to staging,
+        // snapshots, or a rebuild once it turns false.
         offset + positions < maxCacheSize
     }
 
+    /// Rewind the newest `n` positions.
+    ///
+    /// Before the ring wraps this is exact bookkeeping. After it wraps, the ring is
+    /// linearized and the newest rows are cut: the cache stays consistent and the
+    /// logical offset rewinds, but rows the rewound writes overwrote at the old edge
+    /// of the window cannot come back, so the window is up to `n` rows short until
+    /// it refills. Callers that need an exact rewind must gate on
+    /// ``isTrimmable(after:)`` instead of calling this unconditionally.
+    /// Once older rows have been evicted, trimming stops at the pinned `keep` prefix.
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
+        guard n > 0, let keys, let values else { return 0 }
+        wrappedFlag = wrapped
+        let live = wrapped ? keys.dim(2) : idx
+        // A gap between history and live rows means eviction has occurred. Preserve
+        // the pinned prefix regardless of layout, including after repeated trims.
+        // Without a gap, an exact rewind can still remove any of the original rows.
+        let minimum = offset > live ? Swift.min(keep, live) : 0
+        let trimmed = Swift.min(n, live - minimum)
+        guard trimmed > 0 else { return 0 }
+        let bound = live - trimmed
+
+        if wrapped || keys.dim(2) > maxCacheSize {
+            // Linearize a ring before cutting its newest rows. Also shrink oversized
+            // prefill buffers: the next single-token write compacts those buffers to
+            // maxCacheSize and must not treat a discarded suffix as live history.
+            self.keys = temporalOrder(keys)[.ellipsis, ..<bound, 0...]
+            self.values = temporalOrder(values)[.ellipsis, ..<bound, 0...]
+        }
+        idx = bound
         offset -= trimmed
         
         idx -= trimmed
@@ -1027,7 +1100,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                     currentIdx = 0
                 }
 
-                let maskSize = offset < maxCacheSize ? offset + 1 : maxCacheSize
+                let maskSize = (!wrapped && idx < maxCacheSize) ? idx + 1 : maxCacheSize
                 let mask = MLXArray(0 ..< Int32(maskSize)) .>= Int32(maskSize - windowSize)
 
                 // Roll the mask to account for rotation
@@ -1040,7 +1113,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public var debugDescription: String {
-        "\(String(describing: Self.self)) offset: \(offset), maxSize: \(maxCacheSize.description), keep: \(keep), idx: \(idx)"
+        "\(String(describing: Self.self)) offset: \(offset), maxSize: \(maxCacheSize.description), keep: \(keep), idx: \(idx), wrapped: \(wrapped)"
     }
 
     public override func copy() -> any KVCache {
@@ -1896,6 +1969,7 @@ private func cacheClassName(_ cache: KVCache) -> String {
     case is MambaCache: return "MambaCache"
     case is ArraysCache: return "ArraysCache"
     case is RotatingKVCache: return "RotatingKVCache"
+    case is VarianceNormalizedKVCache: return "VarianceNormalizedKVCache"
     case is QuantizedKVCache: return "QuantizedKVCache"
     case is TurboQuantKVCache: return "TurboQuantKVCache"
     case is KVCacheSimple: return "KVCache"
@@ -2207,14 +2281,20 @@ private func restoreCacheFromMetaState(
     case "RotatingKVCache":
         try validatePromptCache(
             className: className, state: state, stateCounts: [0, 2],
-            metadata: metaState, metadataCounts: [5, 6])
+            metadata: metaState, metadataCounts: [5, 6, 7])
         let values = try promptCacheIntegers(metaState.prefix(5), className: className)
-        if metaState.count == 6,
+        if metaState.count >= 6,
             RotatingKVCache.CapacityOrigin(rawValue: metaState[5]) == nil
         {
             throw KVCacheError(
                 message:
                     "Corrupt prompt cache: invalid RotatingKVCache capacity origin '\(metaState[5])'."
+            )
+        }
+        if metaState.count == 7, Bool(metaState[6]) == nil {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: invalid RotatingKVCache wrapped flag '\(metaState[6])'."
             )
         }
 
@@ -2235,6 +2315,80 @@ private func restoreCacheFromMetaState(
             cache.state = state
         }
         cache.metaState = metaState
+        return cache
+
+    case "VarianceNormalizedKVCache":
+        guard metaState.count == 7 || metaState.count == 10 else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: VarianceNormalizedKVCache metadata must contain 7 legacy or 10 versioned values."
+            )
+        }
+        let values = try promptCacheIntegers(Array(metaState.prefix(7)), className: className)
+        let tileSize = values[0]
+        let offset = values[1]
+        let keyBits = values[2]
+        let valueBits = values[3]
+        let sinkhornIterations = values[4]
+        let tileCount = values[5]
+        let tailLength = values[6]
+        guard
+            (try? VarianceNormalizedKVCacheConfiguration(
+                keyBits: keyBits,
+                valueBits: valueBits,
+                tileSize: tileSize,
+                sinkhornIterations: sinkhornIterations)) != nil,
+            offset >= 0,
+            tileCount >= 0,
+            (0 ..< tileSize).contains(tailLength),
+            metaState.count == 7
+                || (Int(metaState[7]) == VarianceNormalizedKVCache.metadataVersion
+                    && (metaState[8] == "none"
+                        || varianceNormalizedDType(named: metaState[8])
+                            .map(isSupportedVarianceNormalizedDType) == true)
+                    && (metaState[9] == "none"
+                        || varianceNormalizedDType(named: metaState[9])
+                            .map(isSupportedVarianceNormalizedDType) == true))
+        else {
+            throw KVCacheError(
+                message: "Corrupt prompt cache: invalid VarianceNormalizedKVCache metadata."
+            )
+        }
+        let (tiledLength, tileLengthOverflow) = tileCount.multipliedReportingOverflow(
+            by: tileSize)
+        let (representedLength, offsetOverflow) = tiledLength.addingReportingOverflow(tailLength)
+        let tailStateCount =
+            tailLength > 0 ? VarianceNormalizedKVCache.tailStateCount : 0
+        let tileStateCount = state.count - min(state.count, tailStateCount)
+        let hasValidTileStateCount =
+            if tileCount == 0 {
+                tileStateCount == 0
+            } else {
+                tileStateCount.isMultiple(of: tileCount)
+                    && [
+                        VarianceNormalizedKVCache.compactTileStateCount,
+                        VarianceNormalizedKVCache.legacyTileStateCount,
+                    ].contains(tileStateCount / tileCount)
+            }
+        guard
+            !tileLengthOverflow,
+            !offsetOverflow,
+            offset == representedLength,
+            state.count >= tailStateCount,
+            hasValidTileStateCount,
+            state.allSatisfy({ $0.ndim == 4 })
+        else {
+            throw KVCacheError(
+                message: "Corrupt prompt cache: invalid VarianceNormalizedKVCache state."
+            )
+        }
+        let cache = VarianceNormalizedKVCache(
+            tileSize: tileSize,
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkhornIterations: sinkhornIterations)
+        cache.metaState = metaState
+        cache.state = state
         return cache
 
     case "ChunkedKVCache":
@@ -2637,7 +2791,8 @@ public func maybeQuantizeKVCache(
 ) {
     if let kvScheme,
         resolveAffineScheme(kvScheme) == nil,
-        resolveTurboScheme(kvScheme) == nil
+        resolveTurboScheme(kvScheme) == nil,
+        resolveVarianceNormalizedScheme(kvScheme) == nil
     {
         return
     }
@@ -2671,4 +2826,127 @@ func maybeAffineQuantizeKVCache(
         return quantized
     }
     return !awaitsCompressionStart
+}
+
+@discardableResult
+func maybeVarianceNormalizeKVCache(
+    cache: inout [KVCache],
+    keyBits: Int,
+    valueBits: Int,
+    tileSize: Int,
+    sinkhornIterations: Int,
+    compressionStart: Int
+) -> Bool {
+    var awaitsCompressionStart = false
+    KVCacheTree.rewrite(&cache) { leaf in
+        guard case .simple(let simple) = leaf.kind else { return leaf.cache }
+        guard simple.offset > compressionStart else {
+            awaitsCompressionStart = true
+            return simple
+        }
+
+        let state = simple.innerState()
+        if state.count >= 2 {
+            guard
+                supportsVarianceNormalizedKVCache(
+                    keyHeadDim: state[0].dim(3),
+                    valueHeadDim: state[1].dim(3),
+                    tileSize: tileSize)
+            else {
+                return simple
+            }
+        }
+
+        return simple.toVarianceNormalized(
+            tileSize: tileSize,
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkhornIterations: sinkhornIterations)
+    }
+    return !awaitsCompressionStart
+}
+
+// MARK: - Attention Helpers
+
+/// Apply a symbolic or array attention mask to score logits.
+func applyAttentionMask(
+    scores: MLXArray,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> MLXArray {
+    switch mask {
+    case .causal:
+        let (qL, kL) = (scores.dim(-2), scores.dim(-1))
+        let qIndices = MLXArray(0 ..< qL) + MLXArray(kL - qL)
+        let kIndices = MLXArray(0 ..< kL)
+        let causalMask = greaterEqual(
+            expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
+        return MLX.where(causalMask, scores, MLXArray.maskFill(for: scores.dtype))
+
+    case .array(let maskArray):
+        if maskArray.dtype == .bool {
+            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+        } else {
+            return scores + maskArray
+        }
+
+    case .arrays(let maskArrays):
+        if let maskArray = maskArrays.first {
+            if maskArray.dtype == .bool {
+                return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+            } else {
+                return scores + maskArray
+            }
+        }
+        return scores
+
+    case .none:
+        return scores
+    }
+}
+
+func attentionScores(
+    queries: MLXArray,
+    keys: MLXArray,
+    scale: Float
+) -> MLXArray {
+    let (batchSize, queryHeadCount, queryLength, headDim) = (
+        queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)
+    )
+    let kvHeadCount = keys.dim(1)
+    let repeats = queryHeadCount / kvHeadCount
+    let scaledQueries = queries * scale
+
+    if repeats > 1 {
+        let groupedQueries = scaledQueries.reshaped([
+            batchSize, kvHeadCount, repeats, queryLength, headDim,
+        ])
+        let groupedKeys = expandedDimensions(keys, axis: -3)
+        return matmul(groupedQueries, groupedKeys.transposed(0, 1, 2, 4, 3))
+            .reshaped(batchSize, queryHeadCount, queryLength, keys.dim(2))
+    } else {
+        return matmul(scaledQueries, keys.transposed(0, 1, 3, 2))
+    }
+}
+
+func attentionValues(
+    weights: MLXArray,
+    values: MLXArray,
+    queryHeadCount: Int
+) -> MLXArray {
+    let (batchSize, _, queryLength, keyLength) = (
+        weights.dim(0), weights.dim(1), weights.dim(2), weights.dim(3)
+    )
+    let kvHeadCount = values.dim(1)
+    let repeats = queryHeadCount / kvHeadCount
+
+    if repeats > 1 {
+        let groupedWeights = weights.reshaped([
+            batchSize, kvHeadCount, repeats, queryLength, keyLength,
+        ])
+        let groupedValues = expandedDimensions(values, axis: -3)
+        return matmul(groupedWeights, groupedValues)
+            .reshaped(batchSize, queryHeadCount, queryLength, values.dim(3))
+    } else {
+        return matmul(weights, values)
+    }
 }

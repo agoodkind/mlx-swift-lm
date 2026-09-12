@@ -124,7 +124,7 @@ private enum Language {
             var freqs = matmul(invFreqExpanded, posExpanded)  // [3, batch, dim/2, seq]
             freqs = freqs.transposed(0, 1, 3, 2)  // [3, batch, seq, dim/2]
 
-            var freqsT = freqs[0]
+            let freqsT = freqs[0]
             var offset = mropeSectionRaw[0]
             for dim in 1 ..< mropeSectionRaw.count {
                 let length = mropeSectionRaw[dim]
@@ -870,7 +870,9 @@ public struct Qwen2VLProcessor: UserInputProcessor {
                 var resizedSize: CGSize = .zero
 
                 let imageSequence = try await MediaProcessing.asProcessedSequence(
-                    video, targetFPS: { _ in Double(2) }
+                    video,
+                    processing: input.processing.video,
+                    targetFPS: { _ in Double(2) }
                 ) { frame in
                     // first apply the user requested resizing, etc. if any
                     let resizedImage = MediaProcessing.apply(
@@ -1082,7 +1084,11 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        visionModel.sanitize(
+        let weights = filterLMHeadWeights(
+            from: weights,
+            tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
+
+        return visionModel.sanitize(
             weights:
                 Dictionary(
                     uniqueKeysWithValues: weights.map { key, value in

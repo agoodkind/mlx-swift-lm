@@ -113,6 +113,7 @@ extension ResolvedModelConfiguration {
             stopStrings: [],
             eosTokenIds: [],
             toolCallFormat: nil,
-            reasoningConfig: nil)
+            reasoningConfig: nil,
+            messageGenerator: nil)
     }
 }

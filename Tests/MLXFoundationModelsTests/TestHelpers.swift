@@ -29,7 +29,7 @@ import UniformTypeIdentifiers
 // For tests that construct an `MLXLanguageModel` but never actually load one:
 // capability assertions and construction paths. No network, no weights.
 
-private struct StubDownloader: MLXLMCommon.Downloader, @unchecked Sendable {
+private struct StubDownloader: MLXLMCommon.Downloader {
     func download(
         id: String,
         revision: String?,
@@ -41,7 +41,7 @@ private struct StubDownloader: MLXLMCommon.Downloader, @unchecked Sendable {
     }
 }
 
-private struct StubTokenizerLoader: MLXLMCommon.TokenizerLoader, @unchecked Sendable {
+private struct StubTokenizerLoader: MLXLMCommon.TokenizerLoader {
     func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer { StubTokenizer() }
 }
 
@@ -109,7 +109,7 @@ func makeExecutorRequest(
     schema: GenerationSchema? = nil,
     generationOptions: GenerationOptions = GenerationOptions(),
     contextOptions: ContextOptions = ContextOptions(),
-    metadata: [String: any Sendable & Codable & Equatable] = [:]
+    metadata: [String: any ConvertibleToGeneratedContent & Sendable] = [:]
 ) -> LanguageModelExecutorGenerationRequest {
     LanguageModelExecutorGenerationRequest(
         id: id,

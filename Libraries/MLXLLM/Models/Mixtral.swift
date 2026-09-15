@@ -138,10 +138,20 @@ class MixtralSparseMoeBlock: Module {
         let gates = gate(x)
 
         let k = topK
-        let inds = MLX.stopGradient(MLX.argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k])
+        let inds: MLXArray
+        let selectedLogits: MLXArray
+        if supportsFusedRouterTopK(gates, k: k) {
+            (inds, selectedLogits) = fusedRouterTopK(
+                selection: gates, values: gates, k: k,
+                normalize: false, order: .descending)
+        } else {
+            inds = MLX.stopGradient(
+                MLX.argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k])
+            selectedLogits = MLX.takeAlong(gates, inds, axis: -1)
+        }
         // Mixtral applies the softmax over the *selected* expert logits (after top-k),
         // unlike the softmax-then-select ordering used by e.g. Qwen3MoE.
-        let scores = MLX.softmax(MLX.takeAlong(gates, inds, axis: -1), axis: -1, precise: true)
+        let scores = MLX.softmax(selectedLogits, axis: -1, precise: true)
 
         let y = switchMLP(x, inds)
         return weightedExpertSum(y, scores)
@@ -234,9 +244,8 @@ public class MixtralModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitizedWeights = weights
 
-        if configuration.tieWordEmbeddings {
-            sanitizedWeights["lm_head.weight"] = nil
-        }
+        sanitizedWeights = filterLMHeadWeights(
+            from: sanitizedWeights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         if sanitizedWeights["model.layers.0.block_sparse_moe.experts.0.w1.weight"] == nil {
             return sanitizedWeights

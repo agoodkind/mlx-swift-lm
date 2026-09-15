@@ -167,6 +167,101 @@ public class ChatSessionTests: XCTestCase {
         }
     }
 
+    /// A model that opts into append-only media cache reuse.
+    ///
+    /// The synthetic text model underneath cannot consume a media payload, so the
+    /// split keeps the token suffix and the payload is stripped in `prepare` -- the
+    /// same shape as `MaskTolerantLanguageModel`. What these tests measure is
+    /// `ChatSession`'s decision, which is made before the model is called.
+    private final class SplittingLanguageModel: Module, LanguageModel, PreparedInputSplitting {
+        let base: any LanguageModel
+        let declinesToSplit: Bool
+
+        init(_ base: any LanguageModel, declinesToSplit: Bool = false) {
+            self.base = base
+            self.declinesToSplit = declinesToSplit
+            super.init()
+        }
+
+        func splitPreparedInput(_ input: LMInput, droppingFirst prefixTokenCount: Int)
+            -> LMInput?
+        {
+            guard !declinesToSplit else { return nil }
+            let ids = input.text.tokens.asArray(Int.self)
+            guard prefixTokenCount > 0, prefixTokenCount < ids.count else { return nil }
+            return LMInput(
+                text: .init(tokens: MLXArray(Array(ids[prefixTokenCount...]))),
+                image: input.image)
+        }
+
+        func prepare(
+            _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+        ) throws -> PrepareResult {
+            try base.prepare(
+                LMInput(tokens: input.text.tokens),
+                cache: cache,
+                state: state,
+                prefill: prefill)
+        }
+
+        func callAsFunction(
+            _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+        ) -> LMOutput {
+            base(input, cache: cache, state: state)
+        }
+
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+            try base.newCache(parameters: parameters)
+        }
+    }
+
+    /// A conformer that honors the protocol's shape but not its contract: it returns
+    /// a suffix starting `extraDrop` tokens past the boundary it was handed. It never
+    /// returns `nil`, so a nil-only check would let it through.
+    private final class MisSplittingLanguageModel: Module, LanguageModel,
+        PreparedInputSplitting
+    {
+        let base: any LanguageModel
+        let extraDrop: Int
+
+        init(_ base: any LanguageModel, extraDrop: Int) {
+            self.base = base
+            self.extraDrop = extraDrop
+            super.init()
+        }
+
+        func splitPreparedInput(_ input: LMInput, droppingFirst prefixTokenCount: Int)
+            -> LMInput?
+        {
+            let ids = input.text.tokens.asArray(Int.self)
+            let wrongStart = prefixTokenCount + extraDrop
+            guard wrongStart > 0, wrongStart < ids.count else { return nil }
+            return LMInput(
+                text: .init(tokens: MLXArray(Array(ids[wrongStart...]))),
+                image: input.image)
+        }
+
+        func prepare(
+            _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+        ) throws -> PrepareResult {
+            try base.prepare(
+                LMInput(tokens: input.text.tokens),
+                cache: cache,
+                state: state,
+                prefill: prefill)
+        }
+
+        func callAsFunction(
+            _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+        ) -> LMOutput {
+            base(input, cache: cache, state: state)
+        }
+
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+            try base.newCache(parameters: parameters)
+        }
+    }
+
     private struct EmptyChatTemplateTokenizer: Tokenizer {
         var bosToken: String? = nil
         var eosToken: String? = nil
@@ -222,7 +317,7 @@ public class ChatSessionTests: XCTestCase {
         }
 
         func prepare(input: UserInput) async throws -> LMInput {
-            let text = try await base.prepare(input: input).text
+            let text = try base.prepare(input: input).text
             guard consumeFirst() else { return LMInput(text: text) }
             return LMInput(
                 text: text,
@@ -346,6 +441,20 @@ public class ChatSessionTests: XCTestCase {
             processor: processor,
             configuration: processor.configuration,
             tokenizer: processor.tokenizer)
+    }
+
+    private func model(
+        processor: MediaAwareInputProcessor, splitting: Bool, declinesToSplit: Bool = false
+    ) -> ModelContext {
+        var context = Self.makeModel(
+            processor: processor,
+            configuration: processor.configuration,
+            tokenizer: processor.tokenizer)
+        if splitting {
+            context.model = SplittingLanguageModel(
+                context.model, declinesToSplit: declinesToSplit)
+        }
+        return context
     }
 
     private func model(processor: MaskedInputProcessor) -> ModelContext {
@@ -640,6 +749,36 @@ public class ChatSessionTests: XCTestCase {
             fullSecondPromptLength - firstPromptLength - 3)
     }
 
+    func testCompletionInfoAttributesReusedCachePrefix() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        let first = try await collectGeneration(session.streamDetails(to: "first"))
+        let firstRenderedLength = await lengthIterator.next()
+        let firstPromptLength = try XCTUnwrap(firstRenderedLength)
+
+        XCTAssertEqual(first.info.cachedPromptTokenCount, 0)
+        XCTAssertEqual(first.info.totalPromptTokenCount, firstPromptLength)
+        XCTAssertEqual(first.info.cacheEfficiency, 0)
+
+        let second = try await collectGeneration(session.streamDetails(to: "second"))
+        let secondRenderedLength = await lengthIterator.next()
+        let fullSecondPromptLength = try XCTUnwrap(secondRenderedLength)
+
+        // The reused prefix is the first prompt plus the tokens it generated.
+        XCTAssertEqual(second.info.cachedPromptTokenCount, firstPromptLength + 3)
+        XCTAssertEqual(second.info.totalPromptTokenCount, fullSecondPromptLength)
+        XCTAssertGreaterThan(second.info.cacheEfficiency, 0)
+    }
+
     func testExactPrefixReuseRebuildsWhenPreparedInputHasMask() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()
@@ -765,6 +904,52 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertEqual(newMediaInfo?.promptTokenCount, thirdRenderedLength)
     }
 
+    /// Returning *a* suffix is not enough. A conformer that returns the wrong tokens
+    /// must be treated exactly like one that declines: the ledger advances to
+    /// `representedTokens` on the strength of the requested boundary, so accepting
+    /// any other suffix would leave the record describing a cache never built.
+    func testAppendOnlyMediaRebuildsWhenModelSplitsAtTheWrongBoundary() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = MediaAwareInputProcessor(tokenizer: tokenizer)
+
+        var context = Self.makeModel(
+            processor: processor,
+            configuration: processor.configuration,
+            tokenizer: processor.tokenizer)
+        context.model = MisSplittingLanguageModel(context.model, extraDrop: 2)
+
+        let session = ChatSession(
+            context, generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(
+            to: "inspect this",
+            image: .array(MLXArray([Float(0)])))
+        _ = await lengthIterator.next()
+
+        for try await _ in session.streamDetails(to: "describe it") {}
+        _ = await lengthIterator.next()
+
+        var newMediaInfo: GenerateCompletionInfo?
+        for try await item in session.streamDetails(
+            to: "now inspect this",
+            role: .user,
+            images: [.array(MLXArray([Float(1)]))],
+            videos: [])
+        {
+            if let info = item.info {
+                newMediaInfo = info
+            }
+        }
+        let thirdRenderedLengthValue = await lengthIterator.next()
+        let thirdRenderedLength = try XCTUnwrap(thirdRenderedLengthValue)
+
+        XCTAssertEqual(
+            newMediaInfo?.promptTokenCount, thirdRenderedLength,
+            "a wrong-boundary split must downgrade to a full rebuild")
+    }
+
     func testLongestCommonPrefixTrimmingFallsBackForHistoricalMedia() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()
@@ -805,6 +990,229 @@ public class ChatSessionTests: XCTestCase {
         }
 
         func didSample(token: MLXArray) {}
+    }
+
+    private struct LiteralTokenizer: Tokenizer {
+        let tokenByCharacter: [Character: Int]
+        let characterByToken: [Int: Character]
+
+        init(output: String) {
+            let characters = Array(Set(output)).sorted { String($0) < String($1) }
+            tokenByCharacter = Dictionary(
+                uniqueKeysWithValues: characters.enumerated().map { ($0.element, $0.offset + 1) })
+            characterByToken = Dictionary(
+                uniqueKeysWithValues: tokenByCharacter.map { ($0.value, $0.key) })
+        }
+
+        var bosToken: String? { nil }
+        var eosToken: String? { nil }
+        var unknownToken: String? { nil }
+        var eosTokenId: Int? { 99 }
+        var unknownTokenId: Int? { 98 }
+
+        func tokens(for output: String) -> [Int] {
+            output.compactMap { tokenByCharacter[$0] }
+        }
+
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [97] }
+
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+            String(tokenIds.compactMap { characterByToken[$0] })
+        }
+
+        func convertTokenToId(_ token: String) -> Int? {
+            token.count == 1 ? token.first.flatMap { tokenByCharacter[$0] } : nil
+        }
+
+        func convertIdToToken(_ id: Int) -> String? {
+            characterByToken[id].map(String.init)
+        }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            [97]
+        }
+    }
+
+    private final class TokenSequenceState: @unchecked Sendable {
+        private let lock = NSLock()
+        private let tokens: [Int32]
+        private var index = 0
+
+        init(tokens: [Int]) {
+            self.tokens = tokens.map(Int32.init)
+        }
+
+        var current: Int32 {
+            lock.withLock { tokens[min(index, tokens.count - 1)] }
+        }
+
+        func advance() {
+            lock.withLock { index = min(index + 1, tokens.count - 1) }
+        }
+    }
+
+    private struct ForceTokenSequenceProcessor: LogitProcessor {
+        let state: TokenSequenceState
+
+        func prompt(_ prompt: MLXArray) {}
+
+        func process(logits: MLXArray) -> MLXArray {
+            let indices = MLXArray(0 ..< Int32(logits.dim(-1)))
+            return MLX.where(
+                indices .== MLXArray(state.current), logits, MLXArray(-Float.infinity))
+        }
+
+        func didSample(token: MLXArray) {
+            state.advance()
+        }
+    }
+
+    private func rejectionSession(
+        output: String,
+        messageGenerator: any MessageGenerator = DefaultMessageGenerator(),
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) -> ChatSession {
+        let tokenizer = LiteralTokenizer(output: output)
+        let configuration = ModelConfiguration(
+            id: "rejected-tool-call-test",
+            eosTokenIds: [99],
+            toolCallFormat: .json)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: messageGenerator)
+        let outputTokens = tokenizer.tokens(for: output) + [99]
+        let components = GenerationComponents {
+            ForceTokenSequenceProcessor(state: TokenSequenceState(tokens: outputTokens))
+        }
+        return ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(
+                maxTokens: outputTokens.count + 1, temperature: 0),
+            components: components,
+            tools: tools,
+            toolDispatch: toolDispatch)
+    }
+
+    func testStreamDetailsEmitsRejectedToolCallAndCompletionCount() async throws {
+        let session = rejectionSession(output: #"<tool_call>{"#)
+        var rejection: RejectedToolCall?
+        var info: GenerateCompletionInfo?
+        var chunks: [String] = []
+
+        for try await event in session.streamDetails(to: "trigger") {
+            if let value = event.rejectedToolCall { rejection = value }
+            if let value = event.info { info = value }
+            if let value = event.chunk { chunks.append(value) }
+        }
+
+        XCTAssertEqual(rejection?.reason, .incompleteOutput)
+        XCTAssertEqual(info?.rejectedToolCallCount, 1)
+        XCTAssertTrue(chunks.isEmpty)
+    }
+
+    func testStreamDetailsReportsRecoveredToolCallCount() async throws {
+        let tools: [ToolSpec] = [
+            ["function": ["name": "weather"] as [String: any Sendable]]
+        ]
+        let session = rejectionSession(
+            output: "<function=weather><parameter=city>Paris</parameter></function>",
+            tools: tools)
+        var call: ToolCall?
+        var info: GenerateCompletionInfo?
+
+        for try await event in session.streamDetails(to: "trigger") {
+            if let value = event.toolCall { call = value }
+            if let value = event.info { info = value }
+        }
+
+        XCTAssertEqual(call?.function.name, "weather")
+        XCTAssertEqual(info?.recoveredToolCallCount, 1)
+        XCTAssertEqual(info?.rejectedToolCallCount, 0)
+    }
+
+    func testTextStreamThrowsRejectedToolCallError() async throws {
+        let session = rejectionSession(output: #"<tool_call>{"#)
+
+        do {
+            for try await _ in session.streamResponse(to: "trigger") {}
+            XCTFail("Expected RejectedToolCallError")
+        } catch let error as RejectedToolCallError {
+            XCTAssertEqual(error.rejection.reason, .incompleteOutput)
+        }
+    }
+
+    func testRejectedGenerationIsNotCommittedToConversation() async throws {
+        let (recordedMessages, continuation) = AsyncStream<[RecordedMessage]>.makeStream()
+        let session = rejectionSession(
+            output: #"<tool_call>{"#,
+            messageGenerator: RecordingMessageGenerator(continuation: continuation))
+
+        for prompt in ["first", "second"] {
+            do {
+                for try await _ in session.streamResponse(to: prompt) {}
+                XCTFail("Expected RejectedToolCallError")
+            } catch is RejectedToolCallError {
+                // Expected. The next request must start from a clean transcript.
+            }
+        }
+        continuation.finish()
+
+        var calls: [[RecordedMessage]] = []
+        for await call in recordedMessages { calls.append(call) }
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0], [.init(role: .user, content: "first")])
+        XCTAssertEqual(calls[1], [.init(role: .user, content: "second")])
+    }
+
+    func testRejectedGenerationPreventsPartialToolDispatch() async throws {
+        let dispatchCount = CallCounter()
+        let output =
+            #"<tool_call>{"name":"allowed","arguments":{}}</tool_call><tool_call>{"#
+        let tools: [ToolSpec] = [
+            [
+                "type": "function",
+                "function": ["name": "allowed"] as [String: any Sendable],
+            ]
+        ]
+        let session = rejectionSession(
+            output: output,
+            tools: tools,
+            toolDispatch: { _ in
+                dispatchCount.increment()
+                return "should not execute"
+            })
+
+        do {
+            for try await _ in session.streamDetails(to: "trigger") {}
+            XCTFail("Expected RejectedToolCallError")
+        } catch let error as RejectedToolCallError {
+            XCTAssertEqual(error.rejection.reason, .incompleteOutput)
+        }
+        XCTAssertEqual(dispatchCount.value, 0)
+    }
+
+    func testToolDispatchWithoutSchemasFailsClosed() async throws {
+        let dispatchCount = CallCounter()
+        let session = rejectionSession(
+            output: #"<tool_call>{"name":"undeclared","arguments":{}}</tool_call>"#,
+            toolDispatch: { _ in
+                dispatchCount.increment()
+                return "should not execute"
+            })
+
+        do {
+            for try await _ in session.streamDetails(to: "trigger") {}
+            XCTFail("Expected RejectedToolCallError")
+        } catch let error as RejectedToolCallError {
+            XCTAssertEqual(error.rejection.reason, .undeclaredTool)
+        }
+        XCTAssertEqual(dispatchCount.value, 0)
     }
 
     /// Thread-safe counter for asserting how many times a `@Sendable` factory runs.
@@ -905,6 +1313,124 @@ public class ChatSessionTests: XCTestCase {
             components: GenerationComponents())
         let result = try await session.respond(to: "hello")
         XCTAssertGreaterThan(result.count, targetLength, result)
+    }
+
+    /// The append-only counterpart of
+    /// `testHistoricalMediaReusesSuffixButNewMediaRebuildsCache`: same transcript,
+    /// same turns, but a model that can split its own prepared input. The new-image
+    /// turn now prefills only the uncached suffix instead of the whole prompt.
+    func testAppendOnlyMediaReusesCacheWhenModelSplitsPreparedInput() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = MediaAwareInputProcessor(tokenizer: tokenizer)
+        let session = ChatSession(
+            model(processor: processor, splitting: true),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(
+            to: "inspect this",
+            image: .array(MLXArray([Float(0)])))
+        _ = await lengthIterator.next()
+
+        for try await _ in session.streamDetails(to: "describe it") {}
+        let secondRenderedLengthValue = await lengthIterator.next()
+        let secondRenderedLength = try XCTUnwrap(secondRenderedLengthValue)
+
+        var newMediaInfo: GenerateCompletionInfo?
+        for try await item in session.streamDetails(
+            to: "now inspect this",
+            role: .user,
+            images: [.array(MLXArray([Float(1)]))],
+            videos: [])
+        {
+            if let info = item.info {
+                newMediaInfo = info
+            }
+        }
+        let thirdRenderedLengthValue = await lengthIterator.next()
+        let thirdRenderedLength = try XCTUnwrap(thirdRenderedLengthValue)
+
+        XCTAssertEqual(
+            newMediaInfo?.promptTokenCount,
+            thirdRenderedLength - secondRenderedLength - 3,
+            "an append-only media turn should prefill only the uncached suffix")
+        // The split boundary is what the turn did not prefill, so it is also what
+        // the completion info must attribute to the cache: the previous prompt
+        // plus the tokens it generated.
+        XCTAssertEqual(
+            newMediaInfo?.cachedPromptTokenCount,
+            secondRenderedLength + 3,
+            "the reused prefix should be attributed to the cache, not dropped")
+        XCTAssertEqual(newMediaInfo?.totalPromptTokenCount, thirdRenderedLength)
+    }
+
+    /// A model that declines the split keeps the pre-existing behavior, which is
+    /// also what every non-conforming model gets.
+    func testAppendOnlyMediaRebuildsWhenModelDeclinesToSplit() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = MediaAwareInputProcessor(tokenizer: tokenizer)
+        let session = ChatSession(
+            model(processor: processor, splitting: true, declinesToSplit: true),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(
+            to: "inspect this",
+            image: .array(MLXArray([Float(0)])))
+        _ = await lengthIterator.next()
+
+        for try await _ in session.streamDetails(to: "describe it") {}
+        _ = await lengthIterator.next()
+
+        var newMediaInfo: GenerateCompletionInfo?
+        for try await item in session.streamDetails(
+            to: "now inspect this",
+            role: .user,
+            images: [.array(MLXArray([Float(1)]))],
+            videos: [])
+        {
+            if let info = item.info {
+                newMediaInfo = info
+            }
+        }
+        let thirdRenderedLengthValue = await lengthIterator.next()
+        let thirdRenderedLength = try XCTUnwrap(thirdRenderedLengthValue)
+
+        XCTAssertEqual(newMediaInfo?.promptTokenCount, thirdRenderedLength)
+    }
+
+    /// Splitting is offered only where the transcript is *extended*. When the
+    /// template rewrites an already-cached tail the turn needs a rewind, and media
+    /// still forces a rebuild there -- the guard PR #472 added is untouched.
+    func testLongestCommonPrefixTrimmingStillFallsBackForMediaWhenModelCanSplit()
+        async throws
+    {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(
+            renderedLengthContinuation: continuation,
+            rewritesCachedTailOnContinuation: true)
+        let processor = MediaAwareInputProcessor(tokenizer: tokenizer)
+        let session = ChatSession(
+            model(processor: processor, splitting: true),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(
+            to: "inspect this",
+            image: .array(MLXArray([Float(0)])))
+        _ = await lengthIterator.next()
+
+        var completionInfo: GenerateCompletionInfo?
+        for try await item in session.streamDetails(to: "describe it") {
+            if let info = item.info {
+                completionInfo = info
+            }
+        }
+        let fullSecondPromptLengthValue = await lengthIterator.next()
+        let fullSecondPromptLength = try XCTUnwrap(fullSecondPromptLengthValue)
+        XCTAssertEqual(completionInfo?.promptTokenCount, fullSecondPromptLength)
     }
 
     func testChatSessionAsyncInterrupt() async throws {

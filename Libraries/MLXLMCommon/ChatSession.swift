@@ -215,11 +215,13 @@ public final class ChatSession {
     private struct AssistantGeneration {
         var content = ""
         var toolCalls: [ToolCall] = []
+        var rejectedToolCalls: [RejectedToolCall] = []
         var stopReason: GenerateStopReason?
         var wasTerminatedByConsumer = false
 
         var shouldRecord: Bool {
             (!content.isEmpty || !toolCalls.isEmpty)
+                && rejectedToolCalls.isEmpty
                 && !wasTerminatedByConsumer
                 && stopReason != .cancelled
         }
@@ -230,6 +232,9 @@ public final class ChatSession {
             }
             if let toolCall = item.toolCall {
                 toolCalls.append(toolCall)
+            }
+            if let rejection = item.rejectedToolCall {
+                rejectedToolCalls.append(rejection)
             }
             if let info = item.info {
                 stopReason = info.stopReason
@@ -310,6 +315,12 @@ public final class ChatSession {
 
     public var additionalContext: [String: any Sendable]?
     public var tools: [ToolSpec]?
+
+    /// Optional automatic dispatcher for accepted tool calls.
+    ///
+    /// Automatic dispatch is fail-closed: only calls naming a function declared
+    /// in ``tools`` can reach this callback. If `tools` is `nil` or empty, every
+    /// tool-call-shaped model output is rejected without invoking the callback.
     public var toolDispatch: (@Sendable (ToolCall) async throws -> String)?
 
     /// Speculative decoding configuration, nil if disabled.
@@ -773,6 +784,8 @@ public final class ChatSession {
     ///   - videos: list of videos (for use with VLMs)
     ///   - audios: list of audios (for use with VLMs)
     /// - Returns: a stream of string chunks from the model
+    /// - Throws: ``RejectedToolCallError`` if the model emits a rejected tool
+    ///   call, or an error produced during generation.
     public func streamResponse(
         to prompt: String,
         role: Chat.Message.Role = .user,
@@ -780,9 +793,10 @@ public final class ChatSession {
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = []
     ) -> AsyncThrowingStream<String, Error> {
-        streamMap(to: prompt, role: role, images: images, videos: videos, audios: audios) {
-            $0.chunk
-        }
+        streamMap(
+            to: prompt, role: role, images: images, videos: videos, audios: audios,
+            failOnRejectedToolCall: true
+        ) { $0.chunk }
     }
 
     /// Produces a streaming response after appending a batch of structured chat messages.
@@ -792,12 +806,12 @@ public final class ChatSession {
     ///
     /// - Parameter messages: chat messages to append before generation
     /// - Returns: a stream of string chunks from the model
+    /// - Throws: ``RejectedToolCallError`` if the model emits a rejected tool
+    ///   call, or an error produced during generation.
     public func streamResponse(
         to messages: consuming [Chat.Message]
     ) -> AsyncThrowingStream<String, Error> {
-        streamMap(messages: messages) {
-            $0.chunk
-        }
+        streamMap(messages: messages, failOnRejectedToolCall: true) { $0.chunk }
     }
 
     /// Produces a streaming response to a prompt as `Generation`.
@@ -809,6 +823,10 @@ public final class ChatSession {
     ///   - videos: list of videos (for use with VLMs)
     ///   - audios: list of audios (for use with VLMs)
     /// - Returns: a stream of `Generation` from the model
+    ///
+    /// Rejected calls are emitted as ``Generation/rejectedToolCall(_:)``. When
+    /// automatic tool dispatch is configured, the stream instead throws
+    /// ``RejectedToolCallError`` before dispatching any call from that turn.
     public func streamDetails(
         to prompt: String,
         role: Chat.Message.Role = .user,
@@ -828,6 +846,10 @@ public final class ChatSession {
     ///
     /// - Parameter messages: chat messages to append before generation
     /// - Returns: a stream of `Generation` from the model
+    ///
+    /// Rejected calls are emitted as ``Generation/rejectedToolCall(_:)``. When
+    /// automatic tool dispatch is configured, the stream instead throws
+    /// ``RejectedToolCallError`` before dispatching any call from that turn.
     public func streamDetails(
         to messages: consuming [Chat.Message]
     ) -> AsyncThrowingStream<Generation, Error> {
@@ -851,18 +873,21 @@ public final class ChatSession {
         images: consuming [UserInput.Image] = [],
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = [],
+        failOnRejectedToolCall: Bool = false,
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         streamMap(
             messages: [
                 .init(role: role, content: prompt, images: images, videos: videos, audios: audios)
             ],
+            failOnRejectedToolCall: failOnRejectedToolCall,
             transform: transform
         )
     }
 
     private func streamMap<R: Sendable>(
         messages: consuming [Chat.Message],
+        failOnRejectedToolCall: Bool = false,
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
@@ -879,6 +904,12 @@ public final class ChatSession {
                 speculativeDecoding
             ] in
             do {
+                // Automatic dispatch must always be schema-authorized. Treat a missing
+                // declaration list as an empty allowlist when a dispatcher is installed,
+                // rather than allowing the processor's schema-less parsing mode.
+                let toolValidationSchemas: [ToolSpec]? =
+                    toolDispatch == nil ? tools : (tools ?? [])
+
                 try await cache.update { cache in
 
                     // these are all Sendable
@@ -1034,6 +1065,9 @@ public final class ChatSession {
 
                         var reusedMainCacheWithoutDraft = false
                         var requiresMainOnlyContinuation = false
+                        // Prompt tokens this turn does not prefill because the cache
+                        // already represents them. Reported to the caller on `.info`.
+                        var cachedPromptTokenCount = 0
                         // Read off the prepared input, not `input`: the latter may be narrowed to
                         // a token-only suffix below, which would hide media the model still sees.
                         let carriesPreparedMedia =
@@ -1072,7 +1106,8 @@ public final class ChatSession {
                                 previousGenerationUncommittedTokens:
                                     currentConversation.uncommittedTokens,
                                 structuredToolCallCount: structuredToolCallCount,
-                                usesSpeculativeDecoding: speculativeDecoding != nil)
+                                usesSpeculativeDecoding: speculativeDecoding != nil,
+                                canSplitPreparedMedia: model is PreparedInputSplitting)
                             let cacheState = PromptCacheState(
                                 cachedTokens: cachedTokenIds,
                                 processedTokenCount: kvCache.processedTokenCount,
@@ -1106,6 +1141,28 @@ public final class ChatSession {
                                 }
                             }
 
+                            // Splitting a prepared input is the other decision that
+                            // can fail while being applied: only the model can carve
+                            // a media-carrying suffix, and it declines any boundary
+                            // it cannot prove equivalent to a cold prefill. Verify
+                            // and downgrade to a rebuild before prefilling.
+                            var mediaSuffixInput: LMInput?
+                            if case .appendMediaSuffix(let suffixStart, _) = decision {
+                                let splitInput = (model as? PreparedInputSplitting)?
+                                    .splitPreparedInput(
+                                        preparedInput, droppingFirst: suffixStart)
+                                // Only the exact tokens the boundary names may be prefilled;
+                                // the ledger below advances on the strength of that boundary.
+                                if let splitInput,
+                                    splitInput.text.tokens.asArray(Int.self)
+                                        == Array(promptTokenIds[suffixStart...])
+                                {
+                                    mediaSuffixInput = splitInput
+                                } else {
+                                    decision = .rebuild
+                                }
+                            }
+
                             switch decision {
                             case .prefillAll:
                                 break
@@ -1113,20 +1170,31 @@ public final class ChatSession {
                             case .appendSuffix(let suffixStart, _):
                                 input = LMInput(
                                     tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
+                                cachedPromptTokenCount = suffixStart
 
                             case .appendSuffixToMain(let suffixStart, _):
                                 input = LMInput(
                                     tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
+                                cachedPromptTokenCount = suffixStart
                                 // The draft does not represent the same private
                                 // Harmony path. Preserve the authoritative main
                                 // cache and use it alone for this continuation.
                                 draftKVCache = nil
                                 requiresMainOnlyContinuation = true
 
+                            case .appendMediaSuffix(let suffixStart, _):
+                                // A declined split was downgraded to `.rebuild`
+                                // above, so this is always populated here.
+                                if let mediaSuffixInput {
+                                    input = mediaSuffixInput
+                                }
+                                cachedPromptTokenCount = suffixStart
+
                             case .trimToCommonPrefix(let commonPrefixLength, _):
                                 input = LMInput(
                                     tokens: MLXArray(
                                         Array(promptTokenIds.dropFirst(commonPrefixLength))))
+                                cachedPromptTokenCount = commonPrefixLength
 
                             case .rebuild:
                                 kvCache = KVCacheStorage(
@@ -1146,7 +1214,8 @@ public final class ChatSession {
                             // keep generated tokens the cold render cannot reproduce.
                             switch decision {
                             case .appendSuffix(_, let representedTokens),
-                                .appendSuffixToMain(_, let representedTokens):
+                                .appendSuffixToMain(_, let representedTokens),
+                                .appendMediaSuffix(_, let representedTokens):
                                 currentConversation.cachedTokens = representedTokens
                             case .prefillAll, .trimToCommonPrefix, .rebuild:
                                 currentConversation.cachedTokens = promptTokenIds
@@ -1176,7 +1245,8 @@ public final class ChatSession {
                                     modelConfiguration: modelConfiguration,
                                     tokenizer: tokenizer,
                                     iterator: iterator,
-                                    tools: tools)
+                                    tools: toolValidationSchemas,
+                                    toolCallPolicy: generateParameters.toolCallPolicy)
                             )
                         }
 
@@ -1260,6 +1330,7 @@ public final class ChatSession {
                                         draftKVCache = nil
                                         lmState = nil
                                         input = preparedInput
+                                        cachedPromptTokenCount = 0
                                     }
 
                                     // Allocate the draft KV cache once and reuse it across turns,
@@ -1298,7 +1369,8 @@ public final class ChatSession {
                                             modelConfiguration: modelConfiguration,
                                             tokenizer: tokenizer,
                                             iterator: iterator,
-                                            tools: tools))
+                                            tools: toolValidationSchemas,
+                                            toolCallPolicy: generateParameters.toolCallPolicy))
                                 }
                             }
                         } else {
@@ -1310,6 +1382,7 @@ public final class ChatSession {
                         var assistant = AssistantGeneration()
 
                         for await item in generation.stream {
+                            let item = item.attributingCachedPromptTokens(cachedPromptTokenCount)
                             assistant.consume(item)
 
                             // collect tool calls for dispatch; if no
@@ -1360,6 +1433,21 @@ public final class ChatSession {
                                     conversationMessageCountBeforePending...)
                             }
                             conversation = currentConversation
+                        }
+
+                        if let rejection = assistant.rejectedToolCalls.first,
+                            failOnRejectedToolCall || toolDispatch != nil
+                        {
+                            // The failed turn was rolled back above. Persist the
+                            // invalidated token ledger before surfacing the error
+                            // so the next request cannot reuse rejected output.
+                            cache = .kvcache(
+                                .init(
+                                    main: kvCache,
+                                    draft: draftKVCache,
+                                    state: lmState,
+                                    conversation: conversation))
+                            throw RejectedToolCallError(rejection)
                         }
 
                         // dispatch all tool calls from this generation pass

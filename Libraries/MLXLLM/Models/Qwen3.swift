@@ -224,11 +224,23 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
-        if configuration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
+        weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         return weights
+    }
+}
+
+extension Qwen3Model: CausalRerankerModel {
+    package func lastTokenLogits(_ inputs: MLXArray, sequenceLengths: [Int]) -> MLXArray {
+        let hidden = model(inputs, cache: nil)
+        let lastHidden = stacked(
+            sequenceLengths.enumerated().map { row, length in hidden[row, length - 1] })
+        if let lmHead {
+            return lmHead(lastHidden)
+        } else {
+            return model.embedTokens.asLinear(lastHidden)
+        }
     }
 }
 

@@ -6,7 +6,8 @@ import Testing
 @testable import MLXLMCommon
 
 /// Router policy: analysis → private reasoning, final → response, allowlisted
-/// commentary → tool call, one call per turn, strict JSON, no undeclared names.
+/// commentary → tool call, one call per turn, strict JSON, and typed rejections
+/// for invalid or undeclared function calls.
 struct HarmonyOutputRouterTests {
 
     @Test("final payload streams as response; analysis remains private reasoning")
@@ -51,6 +52,11 @@ struct HarmonyOutputRouterTests {
             allowed: ["get_weather"])
 
         #expect(events.compactMap(\.toolCall).isEmpty)
+        let rejection = try #require(events.compactMap(\.rejectedToolCall).first)
+        #expect(rejection.reason == .undeclaredTool)
+        #expect(rejection.format == .gptOSS)
+        #expect(rejection.toolName == "secret")
+        #expect(rejection.rawTextPreview == #"{"x":1}"#)
     }
 
     @Test("bare recipients are not treated as function-namespace calls")
@@ -63,6 +69,21 @@ struct HarmonyOutputRouterTests {
             allowed: ["get_weather"])
 
         #expect(events.compactMap(\.toolCall).isEmpty)
+        #expect(events.compactMap(\.rejectedToolCall).isEmpty)
+    }
+
+    @Test("empty function recipient is rejected as a missing tool name")
+    func missingFunctionNameRejected() throws {
+        let events = try route(
+            [
+                "<|channel|>", "commentary to=functions.",
+                "<|message|>", #"{"city":"Paris"}"#, "<|call|>",
+            ],
+            allowed: ["get_weather"])
+
+        let rejection = try #require(events.compactMap(\.rejectedToolCall).first)
+        #expect(rejection.reason == .missingToolName)
+        #expect(rejection.toolName == nil)
     }
 
     @Test("analysis recipient is never dispatched")
@@ -105,6 +126,7 @@ struct HarmonyOutputRouterTests {
             allowed: ["get_weather"])
 
         #expect(events.compactMap(\.toolCall).isEmpty)
+        #expect(events.compactMap(\.rejectedToolCall).first?.reason == .invalidArguments)
     }
 
     @Test("tool-shaped frames require the call commit token")
@@ -117,6 +139,7 @@ struct HarmonyOutputRouterTests {
                 ],
                 allowed: ["get_weather"])
             #expect(events.compactMap(\.toolCall).isEmpty)
+            #expect(events.compactMap(\.rejectedToolCall).first?.reason == .malformedSyntax)
         }
 
         let truncated = try route(
@@ -126,6 +149,7 @@ struct HarmonyOutputRouterTests {
             ],
             allowed: ["get_weather"])
         #expect(truncated.compactMap(\.toolCall).isEmpty)
+        #expect(truncated.compactMap(\.rejectedToolCall).first?.reason == .incompleteOutput)
     }
 
     @Test("code-fenced JSON is not silently unwrapped")
@@ -138,6 +162,7 @@ struct HarmonyOutputRouterTests {
             allowed: ["get_weather"])
 
         #expect(events.compactMap(\.toolCall).isEmpty)
+        #expect(events.compactMap(\.rejectedToolCall).first?.reason == .invalidArguments)
     }
 
     @Test("recipient-less commentary is user-visible response text")
@@ -150,6 +175,125 @@ struct HarmonyOutputRouterTests {
             allowed: ["get_weather"])
 
         #expect(events.compactMap(\.response).joined() == "plan stepsdone")
+    }
+
+    @Test("arguments that violate the declared schema are rejected")
+    func schemaViolationRejected() throws {
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "get_weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": ["city": ["type": "string"]],
+                        "required": ["city"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let events = try route(
+            [
+                "<|channel|>", "commentary to=functions.get_weather",
+                "<|message|>", #"{"city":3}"#, "<|call|>",
+            ],
+            tools: tools, toolCallPolicy: .init(validation: .strict))
+
+        #expect(events.compactMap(\.toolCall).isEmpty)
+        let rejection = try #require(events.compactMap(\.rejectedToolCall).first)
+        #expect(rejection.reason == .invalidArguments)
+        #expect(rejection.toolName == "get_weather")
+        #expect(rejection.detail == "arguments.city must be a string")
+    }
+
+    @Test("Harmony normalizes arguments before independently applying validation")
+    func normalizationAndValidationPolicy() throws {
+        let parameters: [String: any Sendable] = [
+            "type": "object", "properties": ["count": ["type": "integer"]],
+        ]
+        let tools: [[String: any Sendable]] = [
+            ["function": ["name": "search", "parameters": parameters] as [String: any Sendable]]
+        ]
+        for policy in ToolCallValidationPolicy.allCases {
+            for (text, expected): (String, JSONValue?) in [
+                ("6", .int(6)), ("six", policy == .strict ? nil : .string("six")),
+            ] {
+                let events = try route(
+                    [
+                        "<|channel|>", "commentary to=functions.search", "<|message|>",
+                        "{\"count\":\"\(text)\"}", "<|call|>",
+                    ],
+                    tools: tools,
+                    toolCallPolicy: policy == .strict ? .init(validation: .strict) : .init())
+                #expect(
+                    events.compactMap(\.toolCall).first?.function.arguments["count"] == expected)
+                #expect(events.compactMap(\.rejectedToolCall).count == (expected == nil ? 1 : 0))
+            }
+        }
+    }
+
+    @Test("unsupported schema assertions cannot reject a Harmony call")
+    func unsupportedSchemaAssertionFailsOpen() throws {
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "submit",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "code": ["type": "string", "pattern": "^[0-9]+$"]
+                                as [String: any Sendable]
+                        ],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let events = try route(
+            [
+                "<|channel|>", "commentary to=functions.submit",
+                "<|message|>", #"{"code":"not-digits"}"#, "<|call|>",
+            ],
+            tools: tools, toolCallPolicy: .init(validation: .strict))
+
+        #expect(events.compactMap(\.toolCall).map(\.function.name) == ["submit"])
+        #expect(events.compactMap(\.rejectedToolCall).isEmpty)
+    }
+
+    @Test("stream adapter surfaces and counts Harmony rejections")
+    func adapterSurfacesAndCountsRejections() throws {
+        let pieces = [
+            "<|channel|>", "commentary to=functions.secret",
+            "<|message|>", #"{"x":1}"#, "<|call|>",
+            "<|channel|>", "commentary to=functions.allowed",
+            "<|message|>", "not json", "<|call|>",
+        ]
+        let tokenizer = RouterDeterministicTokenizer(tokens: pieces + routerControlTokens)
+        let tools: [[String: any Sendable]] = [
+            ["function": ["name": "allowed"] as [String: any Sendable]]
+        ]
+        var adapter = try #require(
+            HarmonyStreamAdapter(tokenizer: tokenizer, tools: tools, stopStrings: []))
+        var streamEvents: [TokenStreamEvent] = []
+
+        for piece in pieces {
+            let id = try #require(tokenizer.convertTokenToId(piece))
+            #expect(
+                adapter.push(id) {
+                    streamEvents.append($0)
+                    return true
+                })
+        }
+        #expect(
+            adapter.finish {
+                streamEvents.append($0)
+                return true
+            })
+
+        let rejections = streamEvents.compactMap { event -> RejectedToolCall? in
+            guard case .rejectedToolCall(let rejection) = event else { return nil }
+            return rejection
+        }
+        #expect(rejections.map(\.reason) == [.undeclaredTool, .invalidArguments])
+        #expect(adapter.rejectedToolCallCount == 2)
     }
 }
 
@@ -168,12 +312,30 @@ extension HarmonyOutputRouter.Event {
         if case .toolCall(let call) = self { return call }
         return nil
     }
+    fileprivate var rejectedToolCall: RejectedToolCall? {
+        if case .rejectedToolCall(let rejection) = self { return rejection }
+        return nil
+    }
 }
 
 private func route(_ pieces: [String], allowed: Set<String>) throws -> [HarmonyOutputRouter.Event] {
+    try route(
+        pieces,
+        tools: allowed.map { name in
+            ["function": ["name": name] as [String: any Sendable]]
+        })
+}
+
+private func route(
+    _ pieces: [String], tools: [[String: any Sendable]],
+    toolCallPolicy: ToolCallPolicy = .init()
+) throws
+    -> [HarmonyOutputRouter.Event]
+{
     let tokenizer = RouterDeterministicTokenizer(tokens: pieces + routerControlTokens)
     var parser = try #require(HarmonyFrameParser(tokenizer: tokenizer))
-    var router = HarmonyOutputRouter(tokenizer: tokenizer, allowedToolNames: allowed)
+    var router = HarmonyOutputRouter(
+        tokenizer: tokenizer, tools: tools, toolCallPolicy: toolCallPolicy)
     var events: [HarmonyOutputRouter.Event] = []
     for piece in pieces {
         let id = try #require(tokenizer.convertTokenToId(piece))

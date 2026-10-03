@@ -39,7 +39,7 @@ See documentation on [how to integrate mlx-swift-lm and downloaders/tokenizers](
 Add the core package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
 ```
 
 Then chose one of the methods below to select download and tokenizer implementations.

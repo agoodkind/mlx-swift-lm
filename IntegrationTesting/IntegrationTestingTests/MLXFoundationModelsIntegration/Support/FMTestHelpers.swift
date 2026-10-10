@@ -164,7 +164,7 @@ func makeExecutorRequest(
     schema: GenerationSchema? = nil,
     generationOptions: GenerationOptions = GenerationOptions(),
     contextOptions: ContextOptions = ContextOptions(),
-    metadata: [String: any Sendable & Codable & Equatable] = [:]
+    metadata: [String: any ConvertibleToGeneratedContent & Sendable] = [:]
 ) -> LanguageModelExecutorGenerationRequest {
     LanguageModelExecutorGenerationRequest(
         id: id,
@@ -324,7 +324,7 @@ func releaseAllGPUMemory() async {
     Stream.gpu.synchronize()
     await MLXLanguageModel.evictAll()
     Stream.gpu.synchronize()
-    GPU.clearCache()
+    Memory.clearCache()
 }
 
 #endif  // FoundationModelsIntegration

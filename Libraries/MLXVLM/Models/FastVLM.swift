@@ -983,7 +983,8 @@ public struct FastVLMProcessor: UserInputProcessor {
     }
 
     public func prepare(input: MLXLMCommon.UserInput) async throws -> MLXLMCommon.LMInput {
-        let messages = FastVLMMessageGenerator().generate(from: input)
+        let messages = FastVLMMessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         if input.images.isEmpty {
             // No image scenario
@@ -1158,7 +1159,10 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         // Not sure we need to replicate the full Python logic since the weights were transformed on conversion
 
         var sanitizedWeights: [String: MLXArray] = [:]
-        for (k, v) in weights {
+        for (k, v) in filterLMHeadWeights(
+            from: weights,
+            tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
+        {
             var key = k
             if key.contains("mm_projector") {
                 key = key.replacingOccurrences(of: "mm_projector", with: "mm_projector.layers")
@@ -1180,11 +1184,7 @@ public struct FastVLMMessageGenerator: MessageGenerator {
     public func generate(message: Chat.Message) -> MLXLMCommon.Message {
         var dictionary: MLXLMCommon.Message = [
             "role": message.role.rawValue,
-            "content": []
-                + message.images.map { _ in
-                    ["type": "image"]
-                }
-                + [["type": "text", "text": message.content]],
+            "content": contentParts(for: message, layout: .imagesThenText),
         ]
         addToolMetadata(to: &dictionary, for: message)
         return dictionary

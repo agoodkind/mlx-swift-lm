@@ -70,6 +70,14 @@ package func applyKVCacheConfigurationFast(
             keyBits: turbo.keyPrecision.bitWidth,
             valueBits: turbo.valuePrecision.bitWidth,
             quantizedKVStart: turbo.compressionStart)
+    case .varianceNormalized(let varn):
+        maybeVarianceNormalizeKVCache(
+            cache: &cache,
+            keyBits: varn.keyBits,
+            valueBits: varn.valueBits,
+            tileSize: varn.tileSize,
+            sinkhornIterations: varn.sinkhornIterations,
+            compressionStart: varn.compressionStart)
     }
 }
 
@@ -186,6 +194,7 @@ extension KVCacheLeaf {
     ) -> KVCacheLayerStatus {
         let requested = configuration.strategy.identifier
         let layerKind = CacheLayerKind(cache: cache)
+        let memoryBytes = cache.innerState().reduce(0) { $0 + $1.nbytes }
         let capacitySource: KVCacheLayerStatus.CapacitySource? =
             switch self.kind {
             case .recurrent:
@@ -207,7 +216,8 @@ extension KVCacheLeaf {
                 capacitySource: capacitySource,
                 state: state,
                 resolvedStrategy: resolvedStrategy,
-                reason: reason)
+                reason: reason,
+                memoryBytes: memoryBytes)
         }
 
         switch self.kind {
@@ -224,6 +234,12 @@ extension KVCacheLeaf {
                 reason: matches
                     ? (turbo.isCompressed ? nil : .awaitingCompressionStart)
                     : .differentStrategy)
+        case .varianceNormalized:
+            let matches = requested == .varianceNormalized
+            return status(
+                state: matches ? .active : .skipped,
+                resolvedStrategy: .varianceNormalized,
+                reason: matches ? nil : .differentStrategy)
         case .affine:
             let isBoundaryProtection =
                 requested == .turboQuant && protectedPaths.contains(path)

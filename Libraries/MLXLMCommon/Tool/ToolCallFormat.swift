@@ -19,6 +19,16 @@ public protocol ToolCallParser: Sendable {
     /// Returns `nil` for inline formats that don't use wrapper tags.
     var endTag: String? { get }
 
+    /// Whether an unframed JSON object is native call syntax for this parser.
+    var supportsBareJSON: Bool { get }
+
+    /// Whether a declared tool name that begins a line, followed by a JSON
+    /// arguments object, is native call syntax for this parser.
+    ///
+    /// The dialect has no markers, so `ToolCallProcessor` detects it only when
+    /// tool schemas are supplied and the name is one of them.
+    var supportsMarkerlessNamedJSON: Bool { get }
+
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
     ///   - content: The text content to parse (may include tags)
@@ -35,6 +45,9 @@ public protocol ToolCallParser: Sendable {
 }
 
 extension ToolCallParser {
+    public var supportsBareJSON: Bool { false }
+    public var supportsMarkerlessNamedJSON: Bool { false }
+
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {
             return
@@ -61,7 +74,7 @@ extension ToolCallParser {
 /// The raw string values can be used for JSON serialization or CLI parameters.
 ///
 /// Reference: https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/tool_parsers
-public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
+public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Default JSON format used by Llama, Qwen, and most models.
     /// Example: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
     case json
@@ -70,12 +83,22 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
     case lfm2
 
-    /// XML function format used by Nemotron, Qwen3 Coder, Qwen3.5, and similar models.
+    /// XML function format used by Nemotron, Qwen3 Coder, Qwen3 Next, and similar models.
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
 
-    /// GLM4 format with arg_key/arg_value tags.
-    /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
+    /// Qwen 3.5's XML function format with a framed Hermes-JSON compatibility dialect.
+    ///
+    /// Qwen 3.5 is prompted to emit `xmlFunction`, but can sporadically emit the
+    /// Qwen/Hermes JSON dialect used by earlier Qwen models instead. Both dialects
+    /// use the same `<tool_call>` frame; this format accepts either payload without
+    /// enabling bare JSON recovery.
+    case qwen35 = "qwen3_5"
+
+    /// GLM4 format with arg_key/arg_value tags, plus GLM-4-0414's markerless
+    /// function-name-then-JSON dialect.
+    /// Examples: `<tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+    /// and `func\n{"k": "v"}` (detected only for a declared tool).
     case glm4
 
     /// Gemma function call format.
@@ -121,12 +144,15 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     public func createParser() -> any ToolCallParser {
         switch self {
         case .json:
-            return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+            return JSONToolCallParser(
+                startTag: "<tool_call>", endTag: "</tool_call>", supportsBareJSON: true)
         case .lfm2:
             return PythonicToolCallParser(
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .qwen35:
+            return Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
@@ -156,15 +182,18 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     package func makeTokenStreamDecoder(
         tokenizer: any Tokenizer,
         tools: [[String: any Sendable]]?,
-        stopStrings: Set<String>
+        stopStrings: Set<String>,
+        toolCallPolicy: ToolCallPolicy = .init()
     ) -> any TokenStreamDecoder {
         if let decoder = makeProtocolTokenStreamDecoder(
-            tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
+            tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+            toolCallPolicy: toolCallPolicy)
         {
             return decoder
         }
         return StandardTokenStreamDecoder(
-            tokenizer: tokenizer, format: self, tools: tools, stopStrings: stopStrings)
+            tokenizer: tokenizer, format: self, tools: tools, stopStrings: stopStrings,
+            toolCallPolicy: toolCallPolicy)
     }
 
     /// Builds a decoder only for formats which own a framed token protocol.
@@ -174,18 +203,21 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     package func makeProtocolTokenStreamDecoder(
         tokenizer: any Tokenizer,
         tools: [[String: any Sendable]]?,
-        stopStrings: Set<String>
+        stopStrings: Set<String>,
+        toolCallPolicy: ToolCallPolicy = .init()
     ) -> (any TokenStreamDecoder)? {
         switch self {
         case .gptOSS:
             return HarmonyStreamAdapter(
-                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
+                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+                toolCallPolicy: toolCallPolicy)
 
         case .atem:
             return OnyxStreamAdapter(
-                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
+                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+                toolCallPolicy: toolCallPolicy)
 
-        case .json, .lfm2, .xmlFunction, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
             .mistral, .llama3:
             return nil
         }
@@ -207,7 +239,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return HarmonyToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .atem:
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
-        case .json, .lfm2, .xmlFunction, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
             .mistral,
             .llama3:
             return []
@@ -229,7 +261,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
                     count += message.tool?.calls?.count ?? 0
                 }
             }
-        case .json, .lfm2, .xmlFunction, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
             .mistral, .llama3:
             0
         }

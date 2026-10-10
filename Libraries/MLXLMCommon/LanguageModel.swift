@@ -6,15 +6,41 @@ import MLXNN
 
 /// Abstract form of a model that processes language.
 public protocol BaseLanguageModel: Module {
+    /// Normalize tensor names, values, and layer settings before loading the checkpoint.
+    /// The default implementation calls ``sanitize(weights:metadata:)``.
+    func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint
+
     /// Optionally preprocess the weights and modify / remove values as needed.
-    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
+    /// Errors propagate to the checkpoint loader.
+    func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray]
 
     /// Optionally preprocess the weights with access to safetensor metadata.
     ///
     /// The default implementation forwards to ``sanitize(weights:)``.
     /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
     /// and skip or customize sanitization accordingly.
-    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
+        MLXArray]
+}
+
+/// Weight files a model needs that no naming convention or `model.safetensors.index.json`
+/// selects.
+///
+/// A checkpoint can ship weights in a file that neither the conventional `model*.safetensors`
+/// names nor its own index cover: `jinaai/jina-reranker-v3-mlx` keeps its reranking head in
+/// `projector.safetensors` and maps only the transformer shards in its index, so the head is
+/// never read and the model fails to load. The reference implementation has the same gap and
+/// closes it the same way -- the checkpoint's `rerank.py` loads that file by name.
+///
+/// Conform a model to this protocol to name those files. Being explicit rather than widening
+/// the selection is what keeps unrelated weights out: a stray tensor whose name a model's
+/// `sanitize(weights:)` rewrites is loaded silently rather than reported.
+public protocol AdditionalWeightFilesProviding {
+    /// File names, relative to the model directory.
+    ///
+    /// They are loaded after the selected weight files, so a file that is already selected is
+    /// not loaded twice, and names that are not present are ignored.
+    var additionalWeightFiles: [String] { get }
 }
 
 /// Optional metadata a model wants written into converted safetensors.
@@ -26,14 +52,38 @@ public protocol ModelConversionMetadataProvider {
 }
 
 extension BaseLanguageModel {
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = checkpoint
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
     }
 
-    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
         MLXArray]
     {
-        sanitize(weights: weights)
+        try sanitize(weights: weights)
+    }
+}
+
+/// Removes checkpoint tensors owned by an `lm_head` module when the model uses its token
+/// embedding as the output projection instead.
+///
+/// Quantized linear layers carry parameters in addition to `weight` (for example `scales`
+/// and `biases`). Filtering by the module path keeps those parameters from being loaded into
+/// the absent head. Matching a complete path component also supports weights that have already
+/// been namespaced by a wrapper model without affecting similarly named modules.
+package func filterLMHeadWeights(
+    from weights: [String: MLXArray], tiedWordEmbeddings: Bool
+) -> [String: MLXArray] {
+    guard tiedWordEmbeddings else { return weights }
+
+    return weights.filter { key, _ in
+        !key.split(separator: ".").contains("lm_head")
     }
 }
 
@@ -271,6 +321,14 @@ public enum PrepareResult {
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
 public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 
+    /// Build derived state after checkpoint or adapter topology updates and
+    /// before the model is used for inference.
+    ///
+    /// Implementations may materialize arrays or replace storage-sharing
+    /// module views. The library invokes this lifecycle hook while it has
+    /// exclusive access to the model; inference calls must remain read-only.
+    func prepare() throws
+
     /// Prepare the cache state and consume the ``LMInput``.
     ///
     /// `state` is the ``LMOutput/state`` a caller carried over from earlier
@@ -299,6 +357,14 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 
     /// Primary entry point to produce a step (single token) from the model
     func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
+        -> LMOutput
+
+    /// Evaluate all input positions when only the final position's logits are needed.
+    ///
+    /// Implementations may omit earlier logit rows, but must preserve cache updates and
+    /// output state. The default uses the regular forward. Scoring and speculative
+    /// verification must use the regular forward when they need multiple positions.
+    func nextTokenLogits(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
 
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
@@ -330,6 +396,15 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 }
 
 extension LanguageModel {
+    public func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        callAsFunction(input, cache: cache, state: state)
+    }
+
+    /// Most language models have no derived inference state to prepare.
+    public func prepare() throws {}
+
     @available(
         *, deprecated, renamed: "prepare(_:cache:state:prefill:)",
         message:

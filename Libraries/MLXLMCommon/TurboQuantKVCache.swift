@@ -1452,23 +1452,17 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Does NOT include codec overhead (rotation matrices, codebooks) which is shared across layers.
     /// In rawKeyMode: rawKeys is always present (FP16 keys), no keyPackedMSE/keyNorms.
     public var memoryBytes: Int {
-        var total = 0
-        // Raw FP16 buffers (always present in rawKeyMode for keys, or during prefill)
-        if let rk = rawKeys { total += rk.shape.reduce(1, *) * rk.dtype.bytesPerElement }
-        if let rv = rawValues { total += rv.shape.reduce(1, *) * rv.dtype.bytesPerElement }
-        // Compressed storage (K only present when NOT rawKeyMode)
-        if let kw = affKeyW { total += kw.shape.reduce(1, *) * kw.dtype.bytesPerElement }
-        if let ks = affKeyScales { total += ks.shape.reduce(1, *) * ks.dtype.bytesPerElement }
-        if let kb = affKeyBiases { total += kb.shape.reduce(1, *) * kb.dtype.bytesPerElement }
-        if let kp = keyPackedMSE { total += kp.shape.reduce(1, *) * kp.dtype.bytesPerElement }
-        if let kn = keyNorms { total += kn.shape.reduce(1, *) * kn.dtype.bytesPerElement }
-        if let vp = valPackedMSE { total += vp.shape.reduce(1, *) * vp.dtype.bytesPerElement }
-        if let vn = valNorms { total += vn.shape.reduce(1, *) * vn.dtype.bytesPerElement }
-        if let kcs = keyCalibScale { total += kcs.shape.reduce(1, *) * kcs.dtype.bytesPerElement }
-        return total
+        innerState().reduce(0) { $0 + $1.nbytes }
     }
 
     // MARK: - State / Trim
+
+    override public func innerState() -> [MLXArray] {
+        [
+            rawKeys, rawValues, affKeyW, affKeyScales, affKeyBiases,
+            keyPackedMSE, keyNorms, valPackedMSE, valNorms, keyCalibScale,
+        ].compactMap { $0 }
+    }
 
     override public var state: [MLXArray] {
         get {
@@ -1600,6 +1594,32 @@ public class TurboQuantKVCache: BaseKVCache {
             isCompressed = false
         }
         return trimCount
+    }
+
+    override public func copy() -> any KVCache {
+        let new = TurboQuantKVCache(
+            bits: bits, keyBits: keyBits, valueBits: valueBits, seed: seed,
+            keyGroupSize: keyGroupSize)
+        new.offset = offset
+        new.keyMSECodec = keyMSECodec
+        new.valueMSECodec = valueMSECodec
+        // Like `state`, keep only the positions this cache holds. A slice is a new array
+        // object, so a write to either cache rebinds only its own arrays.
+        func held(_ array: MLXArray?) -> MLXArray? { array?[0..., 0..., ..<offset] }
+        new.affKeyW = held(affKeyW)
+        new.affKeyScales = held(affKeyScales)
+        new.affKeyBiases = held(affKeyBiases)
+        new.rawKeys = held(rawKeys)
+        new.rawValues = held(rawValues)
+        new.rawAllocSteps = new.rawKeys?.dim(2) ?? 0
+        new.keyPackedMSE = held(keyPackedMSE)
+        new.keyNorms = held(keyNorms)
+        new.valPackedMSE = held(valPackedMSE)
+        new.valNorms = held(valNorms)
+        new.compressedAllocSteps = new.valPackedMSE?.dim(2) ?? 0
+        new.keyCalibScale = keyCalibScale?[.ellipsis]
+        new.isCompressed = isCompressed
+        return new
     }
 }
 

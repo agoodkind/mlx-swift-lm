@@ -227,7 +227,8 @@ public struct SmolVLMProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)  // TODO: Create SmolVLM2MessageGenerator
+        let messages = Qwen2VLMessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))  // TODO: Create SmolVLM2MessageGenerator
 
         if input.images.isEmpty && input.videos.isEmpty {
             // No image scenario
@@ -321,6 +322,7 @@ public struct SmolVLMProcessor: UserInputProcessor {
 
             let processedFrames = try await MediaProcessing.asProcessedSequence(
                 video,
+                processing: input.processing.video,
                 targetFPS: { duration in
                     // 1 fps for duration >= 10s, apply a multiplier if smaller
                     max((10 - 0.9 * duration.seconds) * targetVideoFPS, 1)

@@ -27,6 +27,8 @@ Developers can use these examples in their own programs -- just import the swift
 - [MLXEmbedders](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxembedders): Popular encoders and embedding models example implementations
 - [MLXGuidedGeneration](Libraries/MLXGuidedGeneration/README.md): Grammar-constrained generation (JSON Schema or EBNF) for any MLX model.
 - [MLXFoundationModels](Libraries/MLXFoundationModels/README.md): Bridge MLX models into Apple's `FoundationModels.LanguageModel` for use with `LanguageModelSession`. (Requires the macOS/iOS/visionOS 27.0 SDK.)
+- [MLXScriptedLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxscriptedlm): Scripted tokenizers and language models -- good for tests or stubbing out behavior without weights
+
 
 ## Usage
 
@@ -39,7 +41,7 @@ See documentation on [how to integrate mlx-swift-lm and downloaders/tokenizers](
 Add the core package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
 ```
 
 Then chose one of the methods below to select download and tokenizer implementations.

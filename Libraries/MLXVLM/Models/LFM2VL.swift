@@ -745,7 +745,8 @@ public struct LFM2VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        let messages = Qwen2VLMessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages,
@@ -781,9 +782,16 @@ public struct LFM2VLProcessor: UserInputProcessor {
             totalImageTokens += h * w
         }
 
-        // Replace image placeholder tokens with the correct count
-        // image_token_id is 396 for LFM2 VL models
-        let imageTokenId = 396
+        // Replace image placeholder tokens with the correct count.
+        //
+        // The id is per-model, not per-family: 396 is LFM2-VL's, while
+        // LFM2.5-VL-3B declares 124907. Hardcoding it meant the expansion below
+        // scanned for a token the template never emitted, left the single
+        // placeholder in place, and the model then aborted the process in
+        // `mergeInputIdsWithImageFeatures` with "tokens: 1, features 1536".
+        // The vocabulary is the authority; the old constant stays as the
+        // fallback for a tokenizer with no `<image>` entry.
+        let imageTokenId = tokenizer.convertTokenToId("<image>") ?? 396
         var newPromptTokens = [Int]()
         var imageIdx = 0
         var i = 0
@@ -875,7 +883,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         pixelValues: MLXArray?,
         spatialShapes: MLXArray?,
         pixelAttentionMask: MLXArray?
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // Ensure inputIds has batch dimension
         var batchedInputIds = inputIds
         if inputIds.ndim == 1 {
@@ -933,7 +941,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         let concatenatedImageFeatures = concatenated(imageFeatures, axis: 0)
 
         // Merge image features with text embeddings
-        return mergeInputIdsWithImageFeatures(
+        return try mergeInputIdsWithImageFeatures(
             imageFeatures: concatenatedImageFeatures,
             inputsEmbeds: inputsEmbeds,
             inputIds: inputIds,
@@ -946,7 +954,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         inputsEmbeds: MLXArray,
         inputIds: MLXArray,
         imageTokenIndex: Int
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // Find image token positions
         var imageIndices = [Int]()
         for (i, v) in inputIds.flattened().asArray(Int.self).enumerated() {
@@ -957,7 +965,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let nImageFeatures = imageFeatures.dim(0)
         if imageIndices.count != nImageFeatures {
-            fatalError(
+            throw VLMError.processing(
                 "Image features and image tokens do not match: tokens: \(imageIndices.count), features \(nImageFeatures)"
             )
         }
@@ -1029,7 +1037,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelAttentionMask = MLXArray.ones([1, numPatches]).asType(.int32)
         }
 
-        let inputEmbeddings = getInputEmbeddings(
+        let inputEmbeddings = try getInputEmbeddings(
             inputIds: input.text.tokens,
             pixelValues: pixelValues,
             spatialShapes: spatialShapes,

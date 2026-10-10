@@ -26,6 +26,9 @@ let package = Package(
             name: "MLXEmbedders",
             targets: ["MLXEmbedders"]),
         .library(
+            name: "MLXRerankers",
+            targets: ["MLXRerankers"]),
+        .library(
             name: "MLXHuggingFace",
             targets: ["MLXHuggingFace"]),
         .library(
@@ -40,6 +43,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXScriptedLM",
+            targets: ["MLXScriptedLM"]),
     ],
     traits: [
         // Gates the MLXLanguageModel adapter for Apple's FoundationModels
@@ -128,6 +134,15 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MLXRerankers",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXEmbedders",
+            ],
+            path: "Libraries/MLXRerankers"
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -145,9 +160,18 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXRerankers",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Libraries/IntegrationTestHelpers",
+            exclude: ["README.md"]
+        ),
+
+        // Scripted tokenizers and models
+        .target(
+            name: "MLXScriptedLM",
+            dependencies: ["MLXLMCommon"],
+            path: "Libraries/MLXScriptedLM",
             exclude: ["README.md"]
         ),
         .testTarget(

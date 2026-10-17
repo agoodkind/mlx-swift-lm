@@ -3,6 +3,7 @@
 import CoreImage
 import Foundation
 import MLX
+import MLXNN
 import Testing
 
 @testable import MLXLMCommon
@@ -833,7 +834,7 @@ struct MuseGlimmerForwardTests {
         let input = LMInput(text: .init(tokens: tokens, mask: ones(like: tokens).asType(.int8)))
 
         let result = try model.prepare(
-            input, cache: model.newCache(parameters: nil), state: nil,
+            input, cache: try model.newCache(parameters: nil), state: nil,
             prefill: PrefillParameters(stepSize: 4))
         guard case .logits(let output) = result else {
             Issue.record("expected logits")
@@ -859,7 +860,7 @@ struct MuseGlimmerForwardTests {
             image: .init(pixels: pixels, frames: frames))
 
         let result = try model.prepare(
-            input, cache: model.newCache(parameters: nil), state: nil,
+            input, cache: try model.newCache(parameters: nil), state: nil,
             prefill: PrefillParameters())
         guard case .logits(let output) = result else {
             Issue.record("expected logits")
@@ -877,7 +878,7 @@ struct MuseGlimmerForwardTests {
                     text: .init(
                         tokens: noPlaceholder, mask: ones(like: noPlaceholder).asType(.int8)),
                     image: .init(pixels: pixels, frames: frames)),
-                cache: model.newCache(parameters: nil), state: nil,
+                cache: try model.newCache(parameters: nil), state: nil,
                 prefill: PrefillParameters())
         }
     }
@@ -885,7 +886,7 @@ struct MuseGlimmerForwardTests {
     @Test("cache mix follows layer types: rotating for sliding, standard for full")
     func cacheMix() throws {
         let model = try Self.model()
-        let caches = model.newCache(parameters: nil)
+        let caches = try model.newCache(parameters: nil)
         // 5 layers, full attention every 4th counting back from the last: 0 and 4.
         #expect(caches.count == 5)
         #expect(caches[0] is StandardKVCache)
@@ -893,6 +894,61 @@ struct MuseGlimmerForwardTests {
         #expect(caches[2] is RotatingKVCache)
         #expect(caches[3] is RotatingKVCache)
         #expect(caches[4] is StandardKVCache)
+    }
+
+    /// `newCache` once dropped `parameters`, so the unbounded full-attention
+    /// caches it returned could not realize a requested capacity and every
+    /// generation entry point rejected the model with `incompatibleCapacity`.
+    @Test("a requested capacity is realized by the full-attention layers")
+    func requestedCapacityIsRealized() throws {
+        let model = try Self.model()
+        let caches = try model.newCache(parameters: GenerateParameters(maxKVSize: 64))
+
+        // Sliding layers keep the architecture window; full layers take the request.
+        #expect(caches.map(\.maxSize) == [64, 8, 8, 8, 64])
+        #expect(throws: Never.self) {
+            try validateKVCacheCompatibility(
+                caches,
+                configuration: KVCacheConfiguration(capacity: try .init(maxTokens: 64)))
+        }
+    }
+
+    /// A capacity below the architecture window must still bound every layer.
+    @Test("a capacity smaller than the sliding window caps the sliding layers too")
+    func capacityBelowSlidingWindow() throws {
+        let model = try Self.model()
+        let caches = try model.newCache(parameters: GenerateParameters(maxKVSize: 4))
+
+        #expect(caches.map(\.maxSize) == [4, 4, 4, 4, 4])
+    }
+
+    /// End-to-end proof that the bounded caches decode correctly: prefill past
+    /// the window, then step tokens through the rotating caches.
+    @Test("generation past the capacity keeps producing finite logits")
+    func decodesPastCapacity() throws {
+        let model = try Self.model()
+        let cache = try model.newCache(parameters: GenerateParameters(maxKVSize: 16))
+        let prompt = MLXArray((0 ..< 24).map { Int32($0 % 60) }).expandedDimensions(axis: 0)
+
+        let prepared = try model.prepare(
+            LMInput(text: .init(tokens: prompt, mask: ones(like: prompt).asType(.int8))),
+            cache: cache, state: nil, prefill: PrefillParameters(stepSize: 8))
+        guard case .logits(let output) = prepared else {
+            Issue.record("expected logits")
+            return
+        }
+
+        var logits = output.logits
+        for step in 0 ..< 12 {
+            let next = MLXArray([Int32(step % 60)]).expandedDimensions(axis: 0)
+            logits = model(next, cache: cache)
+        }
+
+        #expect(logits.dim(-1) == 64)
+        #expect(logits.asType(.float32).sum().item(Float.self).isFinite)
+        // Every attention cache advanced together and none exceeded the bound.
+        #expect(cache.allSatisfy { $0.offset == 36 })
+        #expect(cache.allSatisfy { ($0.maxSize ?? .max) <= 16 })
     }
 }
 
@@ -961,8 +1017,149 @@ struct MuseGlimmerImageBudgetTests {
     }
 }
 
+@Suite("MuseGlimmer text-only prepare")
+struct MuseGlimmerTextOnlyPrepareTests {
+
+    /// A text-only turn must not carry an attention mask: a batch of one has nothing to pad, the
+    /// model never reads `LMInput.text.mask`, and `ChatSession` treats a masked input as
+    /// non-resumable, vetoing prompt-cache reuse on every agentic turn.
+    @Test("text-only input carries no attention mask")
+    func noMaskWithoutImages() async throws {
+        let processor = MuseGlimmerProcessor(
+            MuseGlimmerProcessorConfiguration(),
+            tokenizer: MuseGlimmerStubTokenizer())
+        let input = try await processor.prepare(input: UserInput(prompt: "hello"))
+        #expect(input.text.mask == nil)
+        #expect(input.text.tokens.shape == [1, 4])
+    }
+}
+
+@Suite("MuseGlimmer on-demand vision")
+struct MuseGlimmerOnDemandVisionTests {
+
+    /// One image token over a 2x2 patch grid.
+    private static func imageInput() -> LMInput {
+        LMInput(
+            text: .init(tokens: MLXArray([1, 2, 7, 3, 4] as [Int32]).expandedDimensions(axis: 0)),
+            image: .init(
+                pixels: MLXArray.zeros([4, 2 * 3 * 14 * 14], dtype: .float32),
+                frames: [THW(1, 2, 2)]))
+    }
+
+    private static func textInput() -> LMInput {
+        LMInput(
+            text: .init(tokens: MLXArray([1, 2, 5, 3, 4] as [Int32]).expandedDimensions(axis: 0)))
+    }
+
+    private static func logits(_ model: MuseGlimmer, _ input: LMInput) throws -> MLXArray {
+        let result = try model.prepare(
+            input, cache: try model.newCache(parameters: nil), state: nil,
+            prefill: PrefillParameters())
+        guard case .logits(let output) = result else {
+            throw VLMError.processing("expected logits")
+        }
+        return output.logits
+    }
+
+    private static let quantization = BaseConfiguration.Quantization(groupSize: 32, bits: 4)
+
+    /// Writes a checkpoint that mirrors `Muse-Glimmer-30B-4bit`: the tower is bf16 while the
+    /// adapter and the projection are quantized. `transformers` exports scope the vision modules
+    /// in `model.`.
+    private static func writeCheckpoint(transformersLayout: Bool = false) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseGlimmerOnDemandVision-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let source = try MuseGlimmerForwardTests.model()
+        quantize(
+            model: source, groupSize: 32, bits: 4,
+            filter: { path, _ in path.hasPrefix("vision_adapter") || path == "vision_projection" })
+        var arrays = [String: MLXArray]()
+        for (key, value) in source.parameters().flattened() {
+            let scoped = transformersLayout && key.hasPrefix("vision_")
+            arrays[scoped ? "model.\(key)" : key] = value
+        }
+        if transformersLayout {
+            // `sanitize` drops these; the first image must too.
+            arrays["model.vision_tower.rotary_emb.inv_freq"] = MLXArray.zeros([4])
+        }
+        try save(arrays: arrays, url: directory.appendingPathComponent("model.safetensors"))
+        return directory
+    }
+
+    private static func load(
+        _ directory: URL, excluding excluded: Set<ModelComponent> = [],
+        _ loading: ComponentLoading
+    ) throws -> MuseGlimmer {
+        let model = try MuseGlimmerForwardTests.model()
+        try loadWeights(
+            modelDirectory: directory, model: model, quantization: quantization,
+            excludedComponents: excluded, componentLoading: loading)
+        return model
+    }
+
+    @Test(
+        "vision loads on the first image and matches a full load", arguments: [false, true])
+    func visionLoadsOnFirstImage(transformersLayout: Bool) throws {
+        let directory = try Self.writeCheckpoint(transformersLayout: transformersLayout)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let full = try Self.load(directory, .immediate)
+        let onDemand = try Self.load(directory, .onFirstUse)
+        let excluded = try Self.load(directory, excluding: [.vision], .onFirstUse)
+
+        let names = Set(full.parameters().flattened().map(\.0))
+        let textNames = names.filter { !$0.hasPrefix("vision_") }
+        #expect(names.contains("vision_projection.scales"))
+        #expect(Set(onDemand.parameters().flattened().map(\.0)) == textNames)
+
+        let textLogits = try Self.logits(full, Self.textInput())
+        #expect(arrayEqual(try Self.logits(onDemand, Self.textInput()), textLogits).item(Bool.self))
+        #expect(arrayEqual(try Self.logits(excluded, Self.textInput()), textLogits).item(Bool.self))
+
+        let imageLogits = try Self.logits(full, Self.imageInput())
+        #expect(
+            arrayEqual(try Self.logits(onDemand, Self.imageInput()), imageLogits).item(Bool.self))
+        #expect(Set(onDemand.parameters().flattened().map(\.0)) == textNames)
+        #expect(throws: OnDemandComponentError.self) {
+            _ = try Self.logits(excluded, Self.imageInput())
+        }
+    }
+
+    /// Apps load with a plain configuration and still get images.
+    @Test("the model factory defers vision without any configuration")
+    func factoryDefersVision() async throws {
+        let directory = try Self.writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var config =
+            try JSONSerialization.jsonObject(
+                with: Data(MuseGlimmerForwardTests.tinyJSON.utf8)) as! [String: Any]
+        config["quantization"] = ["group_size": 32, "bits": 4]
+        try JSONSerialization.data(withJSONObject: config).write(
+            to: directory.appendingPathComponent("config.json"))
+        try Data(#"{"processor_class": "MuseGlimmerProcessor"}"#.utf8).write(
+            to: directory.appendingPathComponent("preprocessor_config.json"))
+
+        let context = try await VLMModelFactory.shared.load(
+            from: directory, using: MuseGlimmerStubTokenizerLoader())
+        let model = try #require(context.model as? MuseGlimmer)
+
+        #expect(!model.parameters().flattened().contains { $0.0.hasPrefix("vision_") })
+        let full = try Self.load(directory, .immediate)
+        #expect(
+            arrayEqual(
+                try Self.logits(model, Self.imageInput()), try Self.logits(full, Self.imageInput())
+            ).item(Bool.self))
+    }
+}
+
+private struct MuseGlimmerStubTokenizerLoader: TokenizerLoader {
+    func load(from directory: URL) async throws -> any Tokenizer {
+        MuseGlimmerStubTokenizer()
+    }
+}
+
 /// Minimal tokenizer: the budget tests only exercise `preprocess`, which never
-/// touches it.
+/// touches it, and the text-only prepare test only needs a fixed template.
 private struct MuseGlimmerStubTokenizer: Tokenizer {
     func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
@@ -975,7 +1172,7 @@ private struct MuseGlimmerStubTokenizer: Tokenizer {
         messages: [[String: any Sendable]],
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
-    ) throws -> [Int] { [] }
+    ) throws -> [Int] { [1, 2, 3, 4] }
 }
 
 @Suite("MuseGlimmer agentic protocol")
@@ -1162,6 +1359,69 @@ struct MuseGlimmerAgenticProtocolTests {
         #expect(answer == [.response("sunny")])
     }
 
+    @Test(
+        "Onyx applies the selected validation policy and counts rejections",
+        arguments: ToolCallValidationPolicy.allCases)
+    func onyxSchemaViolationIsCounted(policy: ToolCallValidationPolicy) throws {
+        let tokenizer = OnyxTestTokenizer()
+        let boundedTools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "weather.get",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "days": ["type": "integer", "maximum": 5]
+                                as [String: any Sendable]
+                        ],
+                        "required": ["days"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        var decoder = try #require(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: boundedTools, stopStrings: [],
+                toolCallPolicy: policy == .strict ? .init(validation: .strict) : .init()
+            ))
+        let payload =
+            "<atem:function_calls><atem:invoke name=\"weather.get\">"
+            + "<atem:parameter name=\"days\">6.0</atem:parameter>"
+            + "</atem:invoke></atem:function_calls>"
+        let tokens = [
+            tokenizer.id(" to=weather.get"), tokenizer.message,
+            tokenizer.id(payload), tokenizer.eot,
+        ]
+        var events: [TokenStreamEvent] = []
+        for token in tokens {
+            _ = decoder.push(token) {
+                events.append($0)
+                return true
+            }
+        }
+
+        if policy == .permissive {
+            let calls = events.compactMap { event -> ToolCall? in
+                if case .toolCall(let call) = event { return call }
+                return nil
+            }
+            #expect(calls.count == 1)
+            #expect(calls.first?.function.arguments["days"] == .int(6))
+            #expect(decoder.rejectedToolCallCount == 0)
+            return
+        }
+        #expect(!events.contains { if case .toolCall = $0 { true } else { false } })
+        let rejection = try #require(
+            events.compactMap { event -> RejectedToolCall? in
+                if case .rejectedToolCall(let rejection) = event { return rejection }
+                return nil
+            }.first)
+        #expect(rejection.reason == .invalidArguments)
+        #expect(rejection.toolName == "weather.get")
+        #expect(rejection.detail == "arguments.days must be at most 5")
+        #expect(decoder.rejectedToolCallCount == 1)
+    }
+
     @Test("Onyx decoder emits distinct IDs for consecutive tool frames")
     func consecutiveToolFrames() throws {
         let tokenizer = OnyxTestTokenizer()
@@ -1316,7 +1576,7 @@ struct MuseGlimmerOnyxCacheTests {
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
             draftCacheIsAligned: true,
-            isTrimmable: true)
+            maxTrimCount: live.count)
 
         let decision = try #require(rule.reuse(turn: turn, cache: cache))
         guard case .appendSuffix(let suffixStart, let represented) = decision else {
@@ -1349,7 +1609,7 @@ struct MuseGlimmerOnyxCacheTests {
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
             draftCacheIsAligned: true,
-            isTrimmable: true)
+            maxTrimCount: live.count)
 
         let decision = try #require(rule.reuse(turn: turn, cache: cache))
         guard case .appendSuffix(let suffixStart, let represented) = decision else {
@@ -1382,7 +1642,7 @@ struct MuseGlimmerOnyxCacheTests {
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
             draftCacheIsAligned: true,
-            isTrimmable: true)
+            maxTrimCount: live.count)
 
         #expect(rule.reuse(turn: turn, cache: cache) == nil)
         var uncommitted = turn

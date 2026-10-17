@@ -734,7 +734,8 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     ) throws
         -> PrepareResult
     {
-        let inputIds = input.text.tokens
+        var inputIds = input.text.tokens
+        if inputIds.ndim == 1 { inputIds = inputIds.expandedDimensions(axis: 0) }
         let pixelValues = input.image?.pixels
         let embeddings = getInputEmbeddings(
             inputIds: inputIds,
@@ -764,6 +765,9 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.textConfig.tieWordEmbeddings)
+
         // Rename keys to match Python logic
         var renamed = [String: MLXArray]()
         for (k, v) in weights {

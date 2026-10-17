@@ -14,6 +14,8 @@ import MLX
 
 enum TurboQuantMetalKernels {
 
+    // MLX may bind inputs in constant memory. Infer input pointer address spaces.
+
     /// Scoring kernel: computes attention scores from packed codebook indices.
     ///
     /// Each SIMD group (32 threads) handles one (query, key_token) pair.
@@ -43,8 +45,8 @@ enum TurboQuantMetalKernels {
         uint kv_idx = (q_idx / chunk_len) / repeat_count;
 
         // Pointers
-        const device float* q_ptr = q_rot + q_idx * Dim;
-        const device uint32_t* packed_ptr = packed + kv_idx * token_count * PackedWidth + k_idx * PackedWidth;
+        auto q_ptr = q_rot + q_idx * Dim;
+        auto packed_ptr = packed + kv_idx * token_count * PackedWidth + k_idx * PackedWidth;
         float norm_val = norms[kv_idx * token_count + k_idx];
 
         // Load codebook into registers (small: 4-16 entries)
@@ -286,12 +288,14 @@ enum TurboQuantMetalKernels {
                 if (pos_in_block < half_block) {
                     a = shared_buf[block_id * block_size + pos_in_block];
                     b = shared_buf[block_id * block_size + pos_in_block + half_block];
-                    shared_buf[d] = a + b;
                 } else {
                     a = shared_buf[block_id * block_size + pos_in_block - half_block];
                     b = shared_buf[block_id * block_size + pos_in_block];
-                    shared_buf[d] = a - b;
                 }
+                float next = (pos_in_block < half_block) ? (a + b) : (a - b);
+                // All groups must finish reading this stage before any overwrite.
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                shared_buf[d] = next;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
             wht_val = shared_buf[d];
@@ -474,7 +478,7 @@ enum TurboQuantMetalKernels {
         // Process tokens in this block
         for (uint t = t_start; t < t_end; t++) {
             // --- Score: Q×K dot product ---
-            const device uint32_t* k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
+            auto k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
             float k_norm = key_norms[kv_idx * token_count + t];
 
             float dot_partial = 0.0f;
@@ -502,7 +506,7 @@ enum TurboQuantMetalKernels {
             float exp_diff = exp(m - new_m);
             float exp_score = exp(score - new_m);
 
-            const device uint32_t* v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+            auto v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
             float v_norm = val_norms[kv_idx * token_count + t];
 
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -586,7 +590,7 @@ enum TurboQuantMetalKernels {
         for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
 
         for (uint t = 0; t < token_count; t++) {
-            const device uint32_t* k_packed_ptr =
+            auto k_packed_ptr =
                 key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
             float k_norm = key_norms[kv_idx * token_count + t];
 
@@ -611,7 +615,7 @@ enum TurboQuantMetalKernels {
             float exp_diff = exp(m - new_m);
             float exp_score = exp(score - new_m);
 
-            const device uint32_t* v_packed_ptr =
+            auto v_packed_ptr =
                 val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
             float v_norm = val_norms[kv_idx * token_count + t];
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -717,7 +721,7 @@ enum TurboQuantMetalKernels {
         // Process tokens in this block
         for (uint t = t_start; t < t_end; t++) {
             // --- Score: Q×K, K read raw f16 (no unpack, no rotation) ---
-            const device KT* k_raw_ptr = (const device KT*)k_raw + kv_idx * token_count * Dim + t * Dim;
+            auto k_raw_ptr = k_raw + kv_idx * token_count * Dim + t * Dim;
             float dot_partial = 0.0f;
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
                 uint d = lane + i * 32;
@@ -731,7 +735,7 @@ enum TurboQuantMetalKernels {
             float exp_diff = exp(m - new_m);
             float exp_score = exp(score - new_m);
 
-            const device uint32_t* v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+            auto v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
             float v_norm = val_norms[kv_idx * token_count + t];
 
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -817,11 +821,11 @@ enum TurboQuantMetalKernels {
         // Process tokens in this block
         for (uint t = t_start; t < t_end; t++) {
             // --- Score: Q×K, K dequantized inline from 8-bit affine ---
-            const device uint* k_w_ptr = k_weights + (kv_idx * token_count + t) * (Dim / 4);
-            const device KScaleT* k_s_ptr =
-                (const device KScaleT*)k_scales + (kv_idx * token_count + t) * (Dim / KGroup);
-            const device KBiasT* k_b_ptr =
-                (const device KBiasT*)k_biases + (kv_idx * token_count + t) * (Dim / KGroup);
+            auto k_w_ptr = k_weights + (kv_idx * token_count + t) * (Dim / 4);
+            auto k_s_ptr =
+                k_scales + (kv_idx * token_count + t) * (Dim / KGroup);
+            auto k_b_ptr =
+                k_biases + (kv_idx * token_count + t) * (Dim / KGroup);
             float dot_partial = 0.0f;
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
                 uint d = lane + i * 32;
@@ -837,7 +841,7 @@ enum TurboQuantMetalKernels {
             float exp_diff = exp(m - new_m);
             float exp_score = exp(score - new_m);
 
-            const device uint32_t* v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+            auto v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
             float v_norm = val_norms[kv_idx * token_count + t];
 
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -958,7 +962,7 @@ enum TurboQuantMetalKernels {
         // Process tokens in this block (up to causal boundary)
         for (uint t = t_start; t < t_end; t++) {
             // --- Score: Q×K dot product ---
-            const device uint32_t* k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
+            auto k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
             float k_norm = key_norms[kv_idx * token_count + t];
 
             float dot_partial = 0.0f;
@@ -986,7 +990,7 @@ enum TurboQuantMetalKernels {
             float exp_diff = exp(m - new_m);
             float exp_score = exp(score - new_m);
 
-            const device uint32_t* v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+            auto v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
             float v_norm = val_norms[kv_idx * token_count + t];
 
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -1129,7 +1133,7 @@ enum TurboQuantMetalKernels {
                 // dispatcher only selects this kernel when repeat_count is a
                 // multiple of NR0, so an aligned group can never span a
                 // KV-head boundary and kv_indices[0] is exact.
-                const device uint32_t* k_packed_ptr = key_packed + kv_indices[0] * token_count * KeyPackedWidth + t * KeyPackedWidth;
+                auto k_packed_ptr = key_packed + kv_indices[0] * token_count * KeyPackedWidth + t * KeyPackedWidth;
 
                 uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
                 int k_spill = (int)k_shift + (int)KeyBits - 32;
@@ -1143,7 +1147,7 @@ enum TurboQuantMetalKernels {
 
             // --- Dequant V for this token ONCE ---
             float v_decoded[DIMS_PER_LANE];
-            const device uint32_t* v_packed_ptr = val_packed + kv_indices[0] * token_count * ValuePackedWidth + t * ValuePackedWidth;
+            auto v_packed_ptr = val_packed + kv_indices[0] * token_count * ValuePackedWidth + t * ValuePackedWidth;
             float v_norm = val_norms[kv_indices[0] * token_count + t];
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
                 uint d = lane + i * 32;
@@ -1308,7 +1312,7 @@ enum TurboQuantMetalKernels {
         for (uint t = t_start; t < t_end; t++) {
             // Dequant K once
             float k_decoded[DIMS_PER_LANE];
-            const device uint32_t* k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
+            auto k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
                 uint d = lane + i * 32;
                 if (d >= Dim) { k_decoded[i] = 0.0f; continue; }
@@ -1327,7 +1331,7 @@ enum TurboQuantMetalKernels {
 
             // Dequant V once
             float v_decoded[DIMS_PER_LANE];
-            const device uint32_t* v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+            auto v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
             float v_norm = val_norms[kv_idx * token_count + t];
             for (uint i = 0; i < DIMS_PER_LANE; i++) {
                 uint d = lane + i * 32;
@@ -1558,7 +1562,7 @@ enum TurboQuantMetalKernels {
             if (w < 1e-6f) continue;  // Sparse V: skip negligible attention weights
 
             float norm_val = norms[kv_head * token_count + t];
-            const device uint32_t* packed_ptr = packed + kv_head * token_count * PackedWidth + t * PackedWidth;
+            auto packed_ptr = packed + kv_head * token_count * PackedWidth + t * PackedWidth;
 
             uint bit_offset = d * Bits;
             uint word_idx = bit_offset / 32;
@@ -1726,23 +1730,37 @@ enum TurboQuantKernelOps {
     nonisolated(unsafe) private static var flashSinglePassKernels: [String: MLXFast.MLXFastKernel] =
         [:]
 
-    /// NR0: number of query rows processed per SIMD group in the multi-row amortized kernel.
-    ///
-    /// Ported from llama.cpp V2.1: each threadgroup loads K/V packed data once and reuses
-    /// it across NR0 queries. At NR0=2, the KV dequant cost is halved per query.
-    ///
-    /// NR0=2 is conservative, register pressure is ~24 extra floats per thread (for dim=128).
-    /// Apple M-series GPUs have 96 registers per thread (384 bytes), so this fits comfortably.
-    ///
-    /// Override via environment variable `TURBO_FLASH_NR0` (must be power of 2).
-    static let flashNR0: Int = {
+    /// Explicit NR0 override for profiling and device-specific tuning.
+    /// Values must be powers of two so query groups remain naturally aligned.
+    private static let flashNR0Override: Int? = {
         if let envValue = ProcessInfo.processInfo.environment["TURBO_FLASH_NR0"],
             let parsed = Int(envValue), parsed > 0, (parsed & (parsed - 1)) == 0
         {
             return parsed
         }
-        return 2  // default, conservative starting point
+        return nil
     }()
+
+    /// Choose the number of query rows processed by each SIMD group during decode.
+    ///
+    /// NR0=2 amortizes packed K/V decoding across two query rows and remains the
+    /// long-context default. Immediately above the single-dispatch ceiling,
+    /// however, that reuse does not repay the lost parallelism for small query
+    /// batches. Keep one row per group in the measured crossover region.
+    static func automaticFlashDecodeNR0(tokenCount: Int, totalQueries: Int, dim: Int) -> Int {
+        if tokenCount > flashSinglePassMaxTokens && tokenCount <= 256
+            && (16 ... 32).contains(totalQueries) && (dim == 64 || dim == 128)
+        {
+            return 1
+        }
+        return 2
+    }
+
+    private static func flashDecodeNR0(tokenCount: Int, totalQueries: Int, dim: Int) -> Int {
+        flashNR0Override
+            ?? automaticFlashDecodeNR0(
+                tokenCount: tokenCount, totalQueries: totalQueries, dim: dim)
+    }
 
     /// Default block size for TurboFlashAttention two-pass approach.
     /// Each SIMD group processes this many tokens per block.
@@ -2307,12 +2325,14 @@ enum TurboQuantKernelOps {
         dim: Int,
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil,
-        singleDispatch: Bool? = nil
+        singleDispatch: Bool? = nil,
+        nr0: Int? = nil
     ) -> MLXArray {
         // An explicit block size is used by block-sweep callers and therefore
         // always selects the two-pass implementation. The optional override is
         // internal test/benchmark plumbing; normal callers use the conservative
         // context ceiling above.
+        // `nr0` is also internal test/benchmark plumbing for exact A/B comparisons.
         let kernelSupportsSingleDispatch =
             tokenCount > 0
             && (2 ... 4).contains(keyBits) && (2 ... 4).contains(valueBits)
@@ -2334,7 +2354,9 @@ enum TurboQuantKernelOps {
         let blockSize = blockSize ?? flashBlockSize
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
-        let nr0 = flashNR0
+        let nr0 =
+            nr0
+            ?? flashDecodeNR0(tokenCount: tokenCount, totalQueries: totalQ, dim: dim)
 
         // Use NR0 multi-row kernel when totalQ is evenly divisible by NR0 and NR0 > 1.
         // Falls back to NR0=1 (original kernel) for remainder queries or when NR0=1.
@@ -2408,7 +2430,7 @@ enum TurboQuantKernelOps {
         let blockSize = blockSize ?? flashBlockSize
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
-        let nr0 = flashNR0
+        let nr0 = flashNR0Override ?? 2
 
         // NR0 groups read one kv head (kv_indices[0]) for all rows; only valid
         // when the GQA repeat factor is a multiple of nr0 so aligned groups can

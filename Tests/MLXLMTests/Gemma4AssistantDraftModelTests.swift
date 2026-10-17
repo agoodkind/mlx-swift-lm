@@ -68,10 +68,12 @@ func testSanitizeDropsLmHeadWhenTied() {
     let weights: [String: MLXArray] = [
         "model.embed_tokens.weight": MLXArray.zeros([10, 4]),
         "lm_head.weight": MLXArray.zeros([10, 4]),
+        "lm_head.scales": MLXArray.zeros([1]),
+        "lm_head.biases": MLXArray.zeros([1]),
         "pre_projection.weight": MLXArray.zeros([4, 8]),
     ]
     let sanitized = model.sanitize(weights: weights)
-    #expect(sanitized["lm_head.weight"] == nil)
+    #expect(!sanitized.keys.contains { $0.hasPrefix("lm_head.") })
     #expect(sanitized["model.embed_tokens.weight"] != nil)
     #expect(sanitized["pre_projection.weight"] != nil)
 }
@@ -83,9 +85,13 @@ func testSanitizeKeepsLmHeadWhenNotTied() {
     let weights: [String: MLXArray] = [
         "model.embed_tokens.weight": MLXArray.zeros([10, 4]),
         "lm_head.weight": MLXArray.zeros([10, 4]),
+        "lm_head.scales": MLXArray.zeros([1]),
+        "lm_head.biases": MLXArray.zeros([1]),
     ]
     let sanitized = model.sanitize(weights: weights)
     #expect(sanitized["lm_head.weight"] != nil)
+    #expect(sanitized["lm_head.scales"] != nil)
+    #expect(sanitized["lm_head.biases"] != nil)
 }
 
 // MARK: - Synthetic shape test (no checkpoint needed)
@@ -99,6 +105,12 @@ func testGemma4AssistantDraftModelInstantiatesAndShape() {
     #expect(model.config.tieWordEmbeddings == true)
     // The inner Embedding and Linears are constructed at init.
     // We don't run inference here (would need actual weights + metal kernels).
+}
+
+@Test
+func testGemma4AssistantRejectsNonGemmaTarget() {
+    let model = Gemma4AssistantDraftModel(syntheticConfig(tieWordEmbeddings: true))
+    #expect(!model.isCompatible(with: NonGemmaTarget()))
 }
 
 // MARK: - MaskedEmbedder forward (use_ordered_embeddings)
@@ -401,6 +413,7 @@ func testDraftBlockAcceptsGemma4UnifiedTarget() throws {
     let drafterConfig = try JSONDecoder().decode(
         Gemma4AssistantConfiguration.self, from: Data(drafterJSON.utf8))
     let drafter = Gemma4AssistantDraftModel(drafterConfig)
+    #expect(drafter.isCompatible(with: target))
 
     let lastHiddenSlice = lastHidden[0..., (-1)..., 0...]
     let proposed = drafter.draftBlock(
@@ -415,4 +428,18 @@ func testDraftBlockAcceptsGemma4UnifiedTarget() throws {
     )
     eval(proposed)
     #expect(proposed.shape == [1, 2])
+}
+
+private final class NonGemmaTarget: Module, LanguageModel, KVCacheDimensionProvider {
+    var kvHeads: [Int] { [] }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        MLXArray.zeros([1, 1, 1])
+    }
 }

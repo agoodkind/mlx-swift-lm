@@ -39,10 +39,20 @@ public struct Qwen35ToolCallParser: ToolCallParser, Sendable {
         return call
     }
 
+    public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        guard let startTag else { return [] }
+        return toolCallBuffer.components(separatedBy: startTag).dropFirst().compactMap {
+            parse(content: startTag + $0, tools: tools)
+        }
+    }
+
     /// Returns the body used only to select a parser. The concrete parser remains
     /// responsible for validating the entire payload.
     private func payloadBody(in content: String) -> String? {
-        QwenXMLPayloadScanner.framedPayload(
+        guard let startTag,
+            content.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(startTag)
+        else { return nil }
+        return QwenXMLPayloadScanner.framedPayload(
             in: content, startTag: startTag, endTag: endTag)
     }
 

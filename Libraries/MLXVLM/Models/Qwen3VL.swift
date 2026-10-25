@@ -108,7 +108,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen3VLMessageGenerator().generate(from: input)
+        let messages = Qwen3VLMessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages,
             tools: input.tools,
@@ -117,8 +118,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-            let mask = ones(like: promptArray).asType(.int8)
-            return LMInput(text: .init(tokens: promptArray, mask: mask))
+            return LMInput(tokens: promptArray)
         }
 
         var processedImage: LMInput.ProcessedImage?
@@ -146,7 +146,9 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             for video in input.videos {
                 var resizedSize: CGSize = .zero
                 let sequence = try await MediaProcessing.asProcessedSequence(
-                    video, targetFPS: { _ in Double(2) }
+                    video,
+                    processing: input.processing.video,
+                    targetFPS: { _ in Double(2) }
                 ) { frame in
                     let processed = MediaProcessing.apply(
                         try frame.image.asCIImage(), processing: input.processing)
@@ -282,6 +284,20 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
         case patchSize = "patch_size"
         case temporalPatchSize = "temporal_patch_size"
         case imageProcessorType = "image_processor_type"
+    }
+}
+
+extension Qwen3VLProcessorConfiguration {
+    init(qwen35VisionConfiguration config: Qwen3VLConfiguration.VisionConfiguration) {
+        self.imageMean = [0.5, 0.5, 0.5]
+        self.imageStd = [0.5, 0.5, 0.5]
+        self._minPixels = 65_536
+        self._maxPixels = 16_777_216
+        self._size = nil
+        self.mergeSize = config.spatialMergeSize
+        self.patchSize = config.patchSize
+        self.temporalPatchSize = config.temporalPatchSize
+        self.imageProcessorType = "Qwen2VLImageProcessorFast"
     }
 }
 
@@ -1002,7 +1018,9 @@ enum Qwen3VLVision {
             return (hiddenStates, deepstackOutputs)
         }
 
-        func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        static func sanitize(
+            weights: [String: MLXArray], config: Qwen3VLConfiguration.VisionConfiguration
+        ) -> [String: MLXArray] {
             var sanitized: [String: MLXArray] = [:]
             for (key, value) in weights {
                 if key.contains("position_ids") {
@@ -1018,6 +1036,10 @@ enum Qwen3VLVision {
                 }
             }
             return sanitized
+        }
+
+        func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+            Self.sanitize(weights: weights, config: config)
         }
     }
 }
@@ -1123,7 +1145,7 @@ enum Qwen3VLLanguage {
 
         func callAsFunction(
             _ x: MLXArray,
-            mask: MLXArray?,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode,
             cache: KVCache?,
             positionIds: MLXArray?
         ) -> MLXArray {
@@ -1141,20 +1163,14 @@ enum Qwen3VLLanguage {
 
             values = values.reshaped(batch, length, kvHeads, headDim).transposed(0, 2, 1, 3)
 
-            var kvSequenceLength = keys.dim(-2)
             var positionIds = positionIds
 
             if positionIds == nil {
                 let offset = cache?.offset ?? 0
-                kvSequenceLength += offset + 1
                 var base = MLXArray(stride(from: offset, to: offset + length, by: 1)).asType(.int32)
                 base = tiled(base[.newAxis, 0...], repetitions: [batch, 1])
                 positionIds = base[.newAxis, 0..., 0...]
                 positionIds = tiled(positionIds!, repetitions: [3, 1, 1])
-            } else {
-                if let cache {
-                    kvSequenceLength += cache.offset + 1
-                }
             }
 
             let (cosValues, sinValues) = rotaryEmbedding(positionIds: positionIds!, dtype: x.dtype)
@@ -1162,21 +1178,13 @@ enum Qwen3VLLanguage {
             (queries, keys) = Qwen3VLLanguage.applyMultimodalRotary(
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
 
-            let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask {
-                let slicedMask = mask[.ellipsis, 0 ..< kvSequenceLength]
-                attentionMask = .array(slicedMask)
-            } else {
-                attentionMask = .none
-            }
-
             let output = attentionWithCacheUpdate(
                 queries: queries,
                 keys: keys,
                 values: values,
                 cache: cache,
                 scale: scale,
-                mask: attentionMask
+                mask: mask
             )
             .transposed(0, 2, 1, 3)
             .reshaped(batch, length, -1)
@@ -1223,7 +1231,7 @@ enum Qwen3VLLanguage {
 
         func callAsFunction(
             _ x: MLXArray,
-            mask: MLXArray?,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode,
             cache: KVCache?,
             positionIds: MLXArray?
         ) -> MLXArray {
@@ -1269,9 +1277,11 @@ enum Qwen3VLLanguage {
                 fatalError("Either input ids or embeddings must be provided")
             }
 
-            var mask = mask
-            if mask == nil {
-                mask = createAttentionMask(h: hidden, cache: cache)
+            let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
+            if let mask {
+                attentionMask = .array(mask)
+            } else {
+                attentionMask = createAttentionMask(h: hidden, cache: cache?.first)
             }
 
             // Loop-invariant: the scatter targets the same token positions in
@@ -1284,7 +1294,8 @@ enum Qwen3VLLanguage {
 
             for (index, layer) in layers.enumerated() {
                 let layerCache = cache?[index]
-                hidden = layer(hidden, mask: mask, cache: layerCache, positionIds: positionIds)
+                hidden = layer(
+                    hidden, mask: attentionMask, cache: layerCache, positionIds: positionIds)
 
                 if let embeds = deepstackEmbeds, index < embeds.count,
                     let deepstackIndices
@@ -1997,6 +2008,20 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     }
 }
 
+extension Qwen3VL: PreparedInputSplitting {
+
+    public func splitPreparedInput(_ input: LMInput, droppingFirst prefixTokenCount: Int)
+        -> LMInput?
+    {
+        QwenVL.splitPreparedInput(
+            input,
+            droppingFirst: prefixTokenCount,
+            imageTokenId: config.imageTokenIndex,
+            videoTokenId: config.videoTokenIndex,
+            mergeSize: config.visionConfiguration.spatialMergeSize)
+    }
+}
+
 extension Array where Element == THW {
     fileprivate var nilIfEmpty: [THW]? { isEmpty ? nil : self }
 }
@@ -2017,18 +2042,35 @@ public struct Qwen3VLMessageGenerator: MessageGenerator {
     public init() {}
 
     public func generate(message: Chat.Message) -> MLXLMCommon.Message {
-        let imageContent = message.images.map { _ in
-            ["type": "image"]
-        }
-        let textContent = [["type": "text", "text": message.content]]
-        let videoContent = message.videos.map { _ in
-            ["type": "video"]
+        var message = message
+        var reasoning: String?
+        if message.role == .assistant {
+            let reasoningProtocol = QwenReasoningProtocol.tagged
+            let startDelimiter = reasoningProtocol.startDelimiter
+            let endDelimiter = reasoningProtocol.endDelimiter
+            let reasoningAndContent: Substring?
+            if message.prefilledReasoningStartDelimiter == startDelimiter {
+                reasoningAndContent = message.content[...]
+            } else if message.content.hasPrefix(startDelimiter) {
+                reasoningAndContent = message.content.dropFirst(startDelimiter.count)
+            } else {
+                reasoningAndContent = nil
+            }
+            if let reasoningAndContent,
+                let end = reasoningAndContent.range(of: endDelimiter)
+            {
+                reasoning = String(reasoningAndContent[..<end.lowerBound])
+                message.content = String(reasoningAndContent[end.upperBound...])
+            }
         }
 
         var dictionary: MLXLMCommon.Message = [
             "role": message.role.rawValue,
-            "content": imageContent + videoContent + textContent,
+            "content": contentParts(for: message, layout: .imagesThenVideosThenText),
         ]
+        if let reasoning {
+            dictionary["reasoning_content"] = reasoning
+        }
         addToolMetadata(to: &dictionary, for: message)
         return dictionary
     }

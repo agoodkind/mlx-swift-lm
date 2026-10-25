@@ -201,6 +201,10 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         super.init()
     }
 
+    public func isCompatible(with target: any LanguageModel) -> Bool {
+        target is Gemma4BackboneProviding
+    }
+
     public func draftBlock(
         target: any LanguageModel,
         lastToken: MLXArray,
@@ -332,10 +336,8 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var sanitized = weights
-        if config.tieWordEmbeddings {
-            sanitized.removeValue(forKey: "lm_head.weight")
-        }
+        var sanitized = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.tieWordEmbeddings)
         if let tokenOrdering = sanitized["masked_embedding.token_ordering"] {
             sanitized["masked_embedding.token_ordering"] = tokenOrdering.asType(.int32)
         }

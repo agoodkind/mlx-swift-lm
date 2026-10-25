@@ -31,6 +31,50 @@ public struct Gemma3TextConfiguration: Codable {
     let maxPositionEmbeddings: Int
     let ropeScaling: [String: StringOrNumber]?
 
+    /// Creates a configuration for a small model with the given
+    /// `vocabularySize`.  This is suitable for creating random
+    /// weight models for tests.
+    @_spi(Testing) public static func smallConfiguration(
+        modelType: String = "text", vocabularySize: Int
+    ) -> Self {
+        Gemma3TextConfiguration(
+            modelType: modelType,
+            hiddenSize: 64, hiddenLayers: 8,
+            intermediateSize: 64, attentionHeads: 4,
+            headDim: 64,
+            rmsNormEps: 0.00001, vocabularySize: vocabularySize, kvHeads: 4,
+            ropeTheta: 1_000_000, ropeLocalBaseFreq: 10_000,
+            ropeTraditional: false, queryPreAttnScalar: 256,
+            slidingWindow: 512, slidingWindowPattern: 6,
+            maxPositionEmbeddings: 32768
+        )
+    }
+
+    /// Creates a configuration for the smallest model with the given
+    /// `vocabularySize`. It has one layer, so every layer uses global attention.
+    @_spi(Testing) public static func tinyConfiguration(
+        modelType: String = "gemma3_text", vocabularySize: Int
+    ) -> Self {
+        Gemma3TextConfiguration(
+            modelType: modelType,
+            hiddenSize: 8,
+            hiddenLayers: 1,
+            intermediateSize: 16,
+            attentionHeads: 2,
+            headDim: 4,
+            rmsNormEps: 1e-6,
+            vocabularySize: vocabularySize,
+            kvHeads: 1,
+            ropeTheta: 1_000_000.0,
+            ropeLocalBaseFreq: 10_000.0,
+            ropeTraditional: false,
+            queryPreAttnScalar: 256,
+            slidingWindow: 16,
+            slidingWindowPattern: 1,
+            maxPositionEmbeddings: 64
+        )
+    }
+
     public init(
         modelType: String, hiddenSize: Int, hiddenLayers: Int, intermediateSize: Int,
         attentionHeads: Int, headDim: Int, rmsNormEps: Float, vocabularySize: Int, kvHeads: Int,
@@ -458,6 +502,62 @@ public class Gemma3TextModel: Module, LLMModel {
 
     /// Prefill chunk size when the caller sets none, tuned for this path on Apple Silicon.
     private static let defaultPrefillChunkSize = 128
+}
+
+/// Message generator for TranslateGemma, Google's translation fine-tunes of Gemma 3.
+///
+/// TranslateGemma's chat template needs each user turn tagged with `source_lang_code` /
+/// `target_lang_code` (ISO 639-1); supply them via `UserInput.additionalContext`. Without
+/// those codes this behaves exactly like `DefaultMessageGenerator`.
+public struct TranslateGemma3MessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(from input: UserInput) -> [Message] {
+        guard
+            let source = input.additionalContext?["source_lang_code"] as? String,
+            let target = input.additionalContext?["target_lang_code"] as? String
+        else {
+            return DefaultMessageGenerator().generate(from: input)
+        }
+        return translationMessages(from: input, source: source, target: target)
+    }
+
+    private func translationMessages(
+        from input: UserInput, source: String, target: String
+    ) -> [Message] {
+        let messages: [Chat.Message]
+        switch input.prompt {
+        case .text(let text):
+            messages = [.user(text)]
+        case .chat(let chat):
+            messages = chat
+        case .messages(let raw):
+            // Already model-specific dictionaries; pass through unchanged.
+            return raw
+        }
+
+        // The TranslateGemma template only supports alternating user/assistant turns.
+        return messages.compactMap { message in
+            switch message.role {
+            case .user:
+                return [
+                    "role": "user",
+                    "content": [
+                        [
+                            "type": "text",
+                            "source_lang_code": source,
+                            "target_lang_code": target,
+                            "text": message.content,
+                        ]
+                    ],
+                ]
+            case .assistant:
+                return ["role": "assistant", "content": message.content]
+            case .system, .tool:
+                return nil
+            }
+        }
+    }
 }
 
 extension Gemma3TextModel: LoRAModel {

@@ -66,7 +66,9 @@ final class Qwen3VLContinuationTests: XCTestCase {
             """
         let config = try JSONDecoder().decode(
             Qwen3VLConfiguration.self, from: Data(json.utf8))
-        return Qwen3VL(config)
+        // Pin the initializer weights. Task-local rather than MLXRandom.seed:
+        // parallel tests must not share (or perturb) the global random stream.
+        return withRandomState(MLXRandom.RandomState(seed: 1)) { Qwen3VL(config) }
     }
 
     /// One image with grid THW (1, 4, 4) and merge size 2 — four merged tokens
@@ -106,41 +108,153 @@ final class Qwen3VLContinuationTests: XCTestCase {
         try continuation.assertWarmTextContinuation(try makeTinyModel())
     }
 
+    func testWarmContinuationAfterCacheRotationMatchesDecode() throws {
+        for (capacity, suffixLength) in [(16, 6), (16, 1), (16, 23), (1, 6)] {
+            let model = try makeTinyModel()
+            let parameters = GenerateParameters(
+                kvCache: KVCacheConfiguration(
+                    capacity: try .init(maxTokens: capacity, preservedPrefixTokens: 0)))
+            let cache = try model.newCache(parameters: parameters)
+            let (_, initialState) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: textTokens(capacity))), cache: cache, state: nil,
+                    prefill: .init(chunking: .unchunked)))
+            var state = initialState
+            let decoded = textTokens(5, seed: 3)
+            for index in 0 ..< decoded.dim(1) {
+                let output = model(
+                    .init(tokens: decoded[0..., index ..< index + 1]), cache: cache, state: state)
+                eval(output.logits)
+                state = output.state
+            }
+            XCTAssertTrue(cache.allSatisfy { $0.offset == capacity + 5 })
+
+            let referenceCache = cache.map { $0.copy() }
+            let suffix = textTokens(suffixLength, seed: 9)
+            var referenceState = state
+            var expected = [MLXArray]()
+            for index in 0 ..< suffix.dim(1) {
+                let output = model(
+                    .init(tokens: suffix[0..., index ..< index + 1]), cache: referenceCache,
+                    state: referenceState)
+                eval(output.logits)
+                expected.append(output.logits)
+                referenceState = output.state
+            }
+
+            let result = try model.prepare(
+                LMInput(text: .init(tokens: suffix)), cache: cache, state: state,
+                prefill: .init(chunking: .unchunked))
+            guard case .logits(let output) = result else {
+                return XCTFail("expected logits from warm continuation")
+            }
+            XCTAssertLessThanOrEqual(
+                maxAbsDiff(output.logits, concatenated(expected, axis: 1)),
+                MatmulPrecision.splitTolerance)
+            XCTAssertTrue(cache.allSatisfy { $0.offset == capacity + 5 + suffixLength })
+        }
+    }
+
+    func testWindowedPrefillBeyondCacheCapacityMatchesDecode() throws {
+        let model = try makeTinyModel()
+        let parameters = GenerateParameters(
+            kvCache: KVCacheConfiguration(
+                capacity: try .init(maxTokens: 16, preservedPrefixTokens: 0)))
+        let tokens = textTokens(40)
+        let referenceCache = try model.newCache(parameters: parameters)
+        let (_, initialState) = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: tokens[0..., 0 ..< 1])), cache: referenceCache,
+                state: nil, prefill: .init()))
+        var state = initialState
+        var expected = MLXArray(0)
+        for index in 1 ..< tokens.dim(1) {
+            let output = model(
+                .init(tokens: tokens[0..., index ..< index + 1]), cache: referenceCache,
+                state: state)
+            expected = output.logits[0..., -1, 0...]
+            eval(expected)
+            state = output.state
+        }
+
+        let cache = try model.newCache(parameters: parameters)
+        let (actual, _) = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: tokens)), cache: cache, state: nil,
+                prefill: .init(stepSize: 7)))
+        XCTAssertLessThanOrEqual(maxAbsDiff(actual, expected), MatmulPrecision.splitTolerance)
+        XCTAssertEqual(cache.first?.offset, 40)
+        XCTAssertEqual(cache.first?.state.first?.dim(2), 16)
+    }
+
+    func testWindowedImageContinuationWithPreservedCachePrefix() throws {
+        try withRandomState(MLXRandom.RandomState(seed: 47)) {
+            let model = try makeTinyModel()
+            let parameters = GenerateParameters(
+                kvCache: KVCacheConfiguration(
+                    capacity: try .init(maxTokens: 16, preservedPrefixTokens: 4)))
+            let cache = try model.newCache(parameters: parameters)
+            let prompt = concatenated(
+                [textTokens(6), visionStart(), imageRun(), textTokens(12, seed: 2)], axis: 1)
+            let (initialLogits, state) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: prompt), image: makeImage()), cache: cache,
+                    state: nil, prefill: .init(stepSize: 5)))
+            eval(initialLogits)
+            XCTAssertEqual(cache.first?.offset, 23)
+
+            let (logits, _) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: textTokens(9, seed: 5))), cache: cache,
+                    state: state, prefill: .init(stepSize: 4)))
+            XCTAssertTrue(logits.asArray(Float.self).allSatisfy(\.isFinite))
+            XCTAssertEqual(cache.first?.offset, 32)
+            XCTAssertEqual(cache.first?.state.first?.dim(2), 16)
+        }
+    }
+
     /// A text-only follow-up may be rank-1 even though the cache was seeded by
     /// a batched image prompt. Warm routing must normalize it before slicing.
     func testRank1WarmImageContinuationMatchesFullPrefill() throws {
-        MLXRandom.seed(41)
-        let model = try makeTinyModel()
-        let image = makeImage()
-        let t1 = concatenated(
-            [textTokens(10), visionStart(), imageRun(), textTokens(8, seed: 5)], axis: 1)
-        let t2 = textTokens(8, seed: 9)
+        try withRandomState(MLXRandom.RandomState(seed: 41)) {
+            let model = try makeTinyModel()
+            let image = makeImage()
+            let t1 = concatenated(
+                [textTokens(10), visionStart(), imageRun(), textTokens(8, seed: 5)], axis: 1)
+            let t2 = textTokens(8, seed: 9)
 
-        let fullCache = try model.newCache(parameters: nil)
-        let (fullLogits, _) = try lastLogits(
-            model.prepare(
-                LMInput(text: .init(tokens: concatenated([t1, t2], axis: 1)), image: image),
-                cache: fullCache, state: nil, prefill: .init()))
+            let fullCache = try model.newCache(parameters: nil)
+            let (fullLogits, _) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: concatenated([t1, t2], axis: 1)), image: image),
+                    cache: fullCache, state: nil, prefill: .init()))
 
-        let warmCache = try model.newCache(parameters: nil)
-        let (_, state) = try lastLogits(
-            model.prepare(
-                LMInput(text: .init(tokens: t1), image: image), cache: warmCache, state: nil,
-                prefill: .init()))
-        let (warmLogits, _) = try lastLogits(
-            model.prepare(
-                LMInput(text: .init(tokens: t2[0])), cache: warmCache, state: state,
-                prefill: .init()))
+            let warmCache = try model.newCache(parameters: nil)
+            let (_, state) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: t1), image: image), cache: warmCache, state: nil,
+                    prefill: .init()))
+            let (warmLogits, _) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: t2[0])), cache: warmCache, state: state,
+                    prefill: .init()))
 
-        XCTAssertLessThanOrEqual(
-            maxAbsDiff(warmLogits, fullLogits), 1e-3,
-            "rank-1 warm continuation diverged from full prefill")
+            XCTAssertLessThanOrEqual(
+                maxAbsDiff(warmLogits, fullLogits), MatmulPrecision.splitTolerance,
+                "rank-1 warm continuation diverged from full prefill")
+        }
     }
 
     /// With an image in turn 1, the rope delta the image accumulated must be
     /// carried into turn 2's prefill.
     func testWarmImageContinuationMatchesFullPrefill() throws {
         try continuation.assertWarmImageContinuation(try makeTinyModel())
+    }
+
+    /// The only test that exercises deepstack across a split boundary: the suffix's vision
+    /// run must regenerate per-layer deepstack rows for exactly the retained image.
+    func testSplitMediaSuffixContinuationMatchesFullPrefill() throws {
+        try continuation.assertSplitMediaSuffixContinuation(try makeTinyModel())
     }
 
     /// An image in the middle turn: the continuation must both place the new
@@ -159,36 +273,37 @@ final class Qwen3VLContinuationTests: XCTestCase {
     /// return `.logits`, so both owe the contract: the windowed continuation (which delegates the
     /// per-chunk reports to `forEachChunk`) and the single-shot path.
     func testPrefillProgressReachesTheTotal() throws {
-        MLXRandom.seed(29)
-        let model = try makeTinyModel()
+        try withRandomState(MLXRandom.RandomState(seed: 29)) {
+            let model = try makeTinyModel()
 
-        func events(for prompt: MLXArray, stepSize: Int?) throws -> [[Int]] {
-            final class Log: @unchecked Sendable { var events: [[Int]] = [] }
-            let log = Log()
-            var prefill = PrefillParameters(stepSize: stepSize)
-            prefill.progress = { log.events.append([$0, $1]) }
-            _ = try model.prepare(
-                LMInput(text: .init(tokens: prompt)),
-                cache: try model.newCache(parameters: nil), state: nil, prefill: prefill)
-            return log.events
+            func events(for prompt: MLXArray, stepSize: Int?) throws -> [[Int]] {
+                final class Log: @unchecked Sendable { var events: [[Int]] = [] }
+                let log = Log()
+                var prefill = PrefillParameters(stepSize: stepSize)
+                prefill.progress = { log.events.append([$0, $1]) }
+                _ = try model.prepare(
+                    LMInput(text: .init(tokens: prompt)),
+                    cache: try model.newCache(parameters: nil), state: nil, prefill: prefill)
+                return log.events
+            }
+
+            let prompt = textTokens(40)
+            for (label, stepSize) in [("windowed", 8), ("single-shot", 1024)] {
+                let events = try events(for: prompt, stepSize: stepSize)
+                XCTAssertEqual(
+                    events.last, [40, 40], "\(label) prefill must end at (total, total)")
+                XCTAssertEqual(
+                    events.map { $0[0] }, events.map { $0[0] }.sorted(),
+                    "\(label) progress must be monotone")
+                XCTAssertTrue(
+                    events.allSatisfy { $0[1] == 40 },
+                    "\(label) progress must report a stable total")
+            }
+
+            XCTAssertGreaterThan(
+                try events(for: prompt, stepSize: 8).count, 1,
+                "a windowed prefill should report more than just the terminal event")
         }
-
-        let prompt = textTokens(40)
-        for (label, stepSize) in [("windowed", 8), ("single-shot", 1024)] {
-            let events = try events(for: prompt, stepSize: stepSize)
-            XCTAssertEqual(
-                events.last, [40, 40], "\(label) prefill must end at (total, total)")
-            XCTAssertEqual(
-                events.map { $0[0] }, events.map { $0[0] }.sorted(),
-                "\(label) progress must be monotone")
-            XCTAssertTrue(
-                events.allSatisfy { $0[1] == 40 },
-                "\(label) progress must report a stable total")
-        }
-
-        XCTAssertGreaterThan(
-            try events(for: prompt, stepSize: 8).count, 1,
-            "a windowed prefill should report more than just the terminal event")
     }
 
     func testWindowedPrefillMatchesSingleShot() throws {
@@ -206,29 +321,30 @@ final class Qwen3VLContinuationTests: XCTestCase {
     /// Windowing must not change M-RoPE semantics just because an input carries
     /// a padding mask: Qwen3-VL's baseline forwards no attention mask.
     func testPaddedWindowedImagePrefillMatchesSingleShot() throws {
-        MLXRandom.seed(43)
-        let model = try makeTinyModel()
-        let image = makeImage()
-        let prompt = concatenated(
-            [textTokens(5), visionStart(), imageRun(), textTokens(12, seed: 3)], axis: 1)
-        let padding = MLXArray([Int32](repeating: 0, count: 4)).expandedDimensions(axis: 0)
-        let tokens = concatenated([prompt, padding], axis: 1)
-        let mask = MLXArray(
-            [Int32](repeating: 1, count: prompt.dim(1)) + [Int32](repeating: 0, count: 4)
-        ).expandedDimensions(axis: 0)
-        let input = LMInput(text: .init(tokens: tokens, mask: mask), image: image)
+        try withRandomState(MLXRandom.RandomState(seed: 43)) {
+            let model = try makeTinyModel()
+            let image = makeImage()
+            let prompt = concatenated(
+                [textTokens(5), visionStart(), imageRun(), textTokens(12, seed: 3)], axis: 1)
+            let padding = MLXArray([Int32](repeating: 0, count: 4)).expandedDimensions(axis: 0)
+            let tokens = concatenated([prompt, padding], axis: 1)
+            let mask = MLXArray(
+                [Int32](repeating: 1, count: prompt.dim(1)) + [Int32](repeating: 0, count: 4)
+            ).expandedDimensions(axis: 0)
+            let input = LMInput(text: .init(tokens: tokens, mask: mask), image: image)
 
-        let singleCache = try model.newCache(parameters: nil)
-        let (singleLogits, _) = try lastLogits(
-            model.prepare(input, cache: singleCache, state: nil, prefill: .init()))
+            let singleCache = try model.newCache(parameters: nil)
+            let (singleLogits, _) = try lastLogits(
+                model.prepare(input, cache: singleCache, state: nil, prefill: .init()))
 
-        let windowedCache = try model.newCache(parameters: nil)
-        let (windowedLogits, _) = try lastLogits(
-            model.prepare(input, cache: windowedCache, state: nil, prefill: .init(stepSize: 8)))
+            let windowedCache = try model.newCache(parameters: nil)
+            let (windowedLogits, _) = try lastLogits(
+                model.prepare(input, cache: windowedCache, state: nil, prefill: .init(stepSize: 8)))
 
-        XCTAssertLessThanOrEqual(
-            maxAbsDiff(windowedLogits, singleLogits), 1e-3,
-            "padding changed Qwen3-VL windowed M-RoPE semantics")
+            XCTAssertLessThanOrEqual(
+                maxAbsDiff(windowedLogits, singleLogits), MatmulPrecision.splitTolerance,
+                "padding changed Qwen3-VL windowed M-RoPE semantics")
+        }
     }
 
     // MARK: - Fail-closed continuation state
@@ -237,47 +353,49 @@ final class Qwen3VLContinuationTests: XCTestCase {
     /// silently repositioning the remainder. A cold cache needs no anchor, so a
     /// long cold prefill through the same windowed path still works.
     func testWarmContinuationWithoutStateThrows() throws {
-        MLXRandom.seed(19)
-        let model = try makeTinyModel()
+        try withRandomState(MLXRandom.RandomState(seed: 19)) {
+            let model = try makeTinyModel()
 
-        let cache = try model.newCache(parameters: nil)
-        XCTAssertNoThrow(
-            try model.prepare(
-                LMInput(text: .init(tokens: textTokens(40))), cache: cache, state: nil,
-                prefill: .init(stepSize: 8)),
-            "a long cold prefill carries no anchor and must not throw")
+            let cache = try model.newCache(parameters: nil)
+            XCTAssertNoThrow(
+                try model.prepare(
+                    LMInput(text: .init(tokens: textTokens(40))), cache: cache, state: nil,
+                    prefill: .init(stepSize: 8)),
+                "a long cold prefill carries no anchor and must not throw")
 
-        XCTAssertThrowsError(
-            try model.prepare(
-                LMInput(text: .init(tokens: textTokens(6, seed: 2))), cache: cache, state: nil,
-                prefill: .init())
-        ) { error in
-            guard
-                case ContinuationStateError.missingState(_, let key)? =
-                    error as? ContinuationStateError
-            else {
-                return XCTFail("expected ContinuationStateError.missingState, got \(error)")
+            XCTAssertThrowsError(
+                try model.prepare(
+                    LMInput(text: .init(tokens: textTokens(6, seed: 2))), cache: cache, state: nil,
+                    prefill: .init())
+            ) { error in
+                guard
+                    case ContinuationStateError.missingState(_, let key)? =
+                        error as? ContinuationStateError
+                else {
+                    return XCTFail("expected ContinuationStateError.missingState, got \(error)")
+                }
+                XCTAssertEqual(key, "qwen35vl.ropeDeltas")
             }
-            XCTAssertEqual(key, "qwen35vl.ropeDeltas")
         }
     }
 
     /// A cold prefill must always hand back an anchor — zero for a text-only
     /// prompt — so an ordinary text conversation never trips the guard.
     func testColdTextOnlyPrefillCarriesAnchor() throws {
-        MLXRandom.seed(23)
-        let model = try makeTinyModel()
+        try withRandomState(MLXRandom.RandomState(seed: 23)) {
+            let model = try makeTinyModel()
 
-        let cache = try model.newCache(parameters: nil)
-        let (_, state) = try lastLogits(
-            model.prepare(
-                LMInput(text: .init(tokens: textTokens(10))), cache: cache, state: nil,
-                prefill: .init()))
+            let cache = try model.newCache(parameters: nil)
+            let (_, state) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: textTokens(10))), cache: cache, state: nil,
+                    prefill: .init()))
 
-        guard let anchor = state?[LMOutput.Key<MLXArray>("qwen35vl.ropeDeltas")] else {
-            return XCTFail("cold text-only prefill returned no rope delta")
+            guard let anchor = state?[LMOutput.Key<MLXArray>("qwen35vl.ropeDeltas")] else {
+                return XCTFail("cold text-only prefill returned no rope delta")
+            }
+            XCTAssertEqual(anchor.asType(.int32).item(Int.self), 0)
         }
-        XCTAssertEqual(anchor.asType(.int32).item(Int.self), 0)
     }
 
     // MARK: - Prompt cache round trip
@@ -285,46 +403,48 @@ final class Qwen3VLContinuationTests: XCTestCase {
     /// The end-to-end shape this feature exists for: save a warm image-bearing
     /// cache with its anchor, restore both, and continue equivalently.
     func testImageStateSurvivesPromptCacheRoundTrip() throws {
-        MLXRandom.seed(29)
-        let model = try makeTinyModel()
-        let image = makeImage()
+        try withRandomState(MLXRandom.RandomState(seed: 29)) {
+            let model = try makeTinyModel()
+            let image = makeImage()
 
-        let t1 = concatenated(
-            [textTokens(6), visionStart(), imageRun(), textTokens(6, seed: 2)], axis: 1)
-        let t2 = textTokens(8, seed: 4)
+            let t1 = concatenated(
+                [textTokens(6), visionStart(), imageRun(), textTokens(6, seed: 2)], axis: 1)
+            let t2 = textTokens(8, seed: 4)
 
-        let warmCache = try model.newCache(parameters: nil)
-        let (_, savedState) = try lastLogits(
-            model.prepare(
-                LMInput(text: .init(tokens: t1), image: image), cache: warmCache, state: nil,
-                prefill: .init()))
-        XCTAssertNotNil(savedState)
+            let warmCache = try model.newCache(parameters: nil)
+            let (_, savedState) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: t1), image: image), cache: warmCache, state: nil,
+                    prefill: .init()))
+            XCTAssertNotNil(savedState)
 
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("safetensors")
-        defer { try? FileManager.default.removeItem(at: url) }
-        try savePromptCache(url: url, cache: warmCache, state: savedState)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+                .appendingPathExtension("safetensors")
+            defer { try? FileManager.default.removeItem(at: url) }
+            try savePromptCache(url: url, cache: warmCache, state: savedState)
 
-        let snapshot = try loadPromptCacheSnapshot(url: url)
-        let (warmLogits, _) = try lastLogits(
-            model.prepare(
-                LMInput(text: .init(tokens: t2)), cache: warmCache, state: savedState,
-                prefill: .init()))
-        let (restoredLogits, _) = try lastLogits(
-            model.prepare(
-                LMInput(text: .init(tokens: t2)), cache: snapshot.cache, state: snapshot.state,
-                prefill: .init()))
+            let snapshot = try loadPromptCacheSnapshot(url: url)
+            let (warmLogits, _) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: t2)), cache: warmCache, state: savedState,
+                    prefill: .init()))
+            let (restoredLogits, _) = try lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: t2)), cache: snapshot.cache, state: snapshot.state,
+                    prefill: .init()))
 
-        XCTAssertLessThanOrEqual(
-            maxAbsDiff(restoredLogits, warmLogits), 1e-6,
-            "disk-restored state diverged from the live warm continuation")
+            XCTAssertLessThanOrEqual(
+                maxAbsDiff(restoredLogits, warmLogits), 1e-6,
+                "disk-restored state diverged from the live warm continuation")
 
-        // Dropping the state on restore is the bug this feature prevents; it
-        // must fail loudly rather than decode at the wrong positions.
-        let keptCache = try loadPromptCacheSnapshot(url: url).cache
-        XCTAssertThrowsError(
-            try model.prepare(
-                LMInput(text: .init(tokens: t2)), cache: keptCache, state: nil, prefill: .init()))
+            // Dropping the state on restore is the bug this feature prevents; it
+            // must fail loudly rather than decode at the wrong positions.
+            let keptCache = try loadPromptCacheSnapshot(url: url).cache
+            XCTAssertThrowsError(
+                try model.prepare(
+                    LMInput(text: .init(tokens: t2)), cache: keptCache, state: nil, prefill: .init()
+                ))
+        }
     }
 }

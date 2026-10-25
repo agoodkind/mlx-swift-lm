@@ -1080,11 +1080,17 @@ public struct Gemma3Processor: UserInputProcessor {
 
     public func prepare(input: UserInput) async throws -> LMInput {
         // Use structured content message generator for Gemma3's chat template
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        let messages = Qwen2VLMessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+
+        if input.images.isEmpty {
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
+            return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
+        }
 
         // Process images if any
         var processedImage: LMInput.ProcessedImage?

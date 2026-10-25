@@ -14,7 +14,7 @@ extension MLXTestingSuite {
             try withMemoryLimit {
                 let model = Gemma4(try makeConfiguration(tieWordEmbeddings: tieWordEmbeddings))
                 eval(model)
-                let frameCount = 5
+                let frameCount = 40
                 let pixels =
                     MLXArray(0 ..< frameCount * 48)
                     .reshaped([frameCount, 3, 4, 4]).asType(.float32) / 240

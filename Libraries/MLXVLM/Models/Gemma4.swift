@@ -2195,11 +2195,13 @@ public struct Gemma4Processor: UserInputProcessor {
                 frameCount, timestamps in
                 let frames: [String] = (0 ..< frameCount).map { idx in
                     let seconds = timestamps[idx]
-                    let minutes = Int(seconds) / 60
-                    let remainingSeconds = seconds - Double(minutes * 60)
+                    let totalMicroseconds = Int64((seconds * 1_000_000).rounded())
+                    let minutes = totalMicroseconds / 60_000_000
+                    let remainingSeconds = (totalMicroseconds / 1_000_000) % 60
+                    let microseconds = totalMicroseconds % 1_000_000
                     let timestamp = String(
-                        format: "%02d:%09.6f", locale: Locale(identifier: "en_US_POSIX"),
-                        minutes, remainingSeconds)
+                        format: "%02lld:%02lld.%06lld", locale: Locale(identifier: "en_US_POSIX"),
+                        minutes, remainingSeconds, microseconds)
                     let videoTokenString = String(
                         repeating: Self.videoPlaceholder, count: config.videoSeqLength)
                     return "\(timestamp) \(config.boiTokenString)\(videoTokenString)\(config.eoiTokenString)"

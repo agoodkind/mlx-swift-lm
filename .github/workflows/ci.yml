@@ -13,13 +13,13 @@ on:
         required: true
         default: 786724757aa480f049d3a913c59da7e0e61ad5dc
       library_ref:
-        description: Exact library commit; an empty value selects the triggering commit
+        description: Exact library commit; an empty value selects the PR head or triggering commit
         type: string
       swiftlm_ref:
         description: Exact SwiftLM commit to validate
         type: string
         required: true
-        default: d2f09fb66097739de05c63397e18bd259edeadd0
+        default: dbf4eee36701d844996038b182a272f40a41f414
       run_speculative_eval:
         description: Download both models for speculative decoding evaluation (15-minute limit)
         type: boolean
@@ -43,8 +43,8 @@ permissions:
 env:
   DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
   CORE_REF: ${{ inputs.core_ref || '786724757aa480f049d3a913c59da7e0e61ad5dc' }}
-  LIBRARY_REF: ${{ inputs.library_ref || github.sha }}
-  SWIFTLM_REF: ${{ inputs.swiftlm_ref || 'd2f09fb66097739de05c63397e18bd259edeadd0' }}
+  LIBRARY_REF: ${{ inputs.library_ref || github.event.pull_request.head.sha || github.sha }}
+  SWIFTLM_REF: ${{ inputs.swiftlm_ref || 'dbf4eee36701d844996038b182a272f40a41f414' }}
 
 jobs:
   build-and-test:

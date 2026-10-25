@@ -64,7 +64,7 @@ jobs:
   build-and-test:
     name: Build and Test (macOS 26)
     needs: select_macos_runner
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
     timeout-minutes: 40
     env:
@@ -248,7 +248,7 @@ jobs:
   integration-test:
     name: Build & Test SwiftLM Integration
     needs: select_macos_runner
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:

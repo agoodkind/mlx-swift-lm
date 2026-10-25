@@ -1150,17 +1150,24 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         cache: [KVCache]? = nil,
         inputsEmbeds: MLXArray? = nil,
         perLayerInputs: MLXArray? = nil,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        lastPositionOnly: Bool = false
     ) -> LMOutput {
         let output = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
             perLayerInputs: perLayerInputs
         )
+        let projectionInput: MLXArray
+        if lastPositionOnly, output.dim(1) > 1 {
+            projectionInput = output[0..., (output.dim(1) - 1)..., 0...]
+        } else {
+            projectionInput = output
+        }
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(output)
+            logits = lmHead(projectionInput)
         } else {
-            logits = model.embedTokens.asLinear(output)
+            logits = model.embedTokens.asLinear(projectionInput)
         }
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
             let scale = MLXArray(finalLogitSoftcapping)
@@ -1911,7 +1918,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
                 nil,
                 cache: convertedCache,
                 inputsEmbeds: inputsEmbeds,
-                perLayerInputs: perLayerInputs
+                perLayerInputs: perLayerInputs,
+                lastPositionOnly: true
             )
             return .logits(result)
         } else {

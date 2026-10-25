@@ -9,10 +9,10 @@ import Testing
 extension MLXTestingSuite {
     @Suite
     struct Gemma4VideoTests {
-        @Test("Gemma consumes video pixels across vision chunks")
-        func videoPixelsChangeLogitsAcrossChunks() throws {
+        @Test("Gemma consumes video pixels across vision chunks", arguments: [true, false])
+        func videoPixelsChangeLogitsAcrossChunks(tieWordEmbeddings: Bool) throws {
             try withMemoryLimit {
-                let model = Gemma4(try makeConfiguration())
+                let model = Gemma4(try makeConfiguration(tieWordEmbeddings: tieWordEmbeddings))
                 eval(model)
                 let frameCount = 5
                 let pixels =
@@ -29,17 +29,18 @@ extension MLXTestingSuite {
                 ])
                 let changed = try logits(model, tokens: tokens, video: changedPixels)
 
-                #expect(original.shape == [1, tokens.count, 64])
+                #expect(original.shape == [1, 1, 64])
+                #expect(original.nbytes == 64 * MemoryLayout<Float>.size)
                 #expect(isFinite(original).all().item(Bool.self))
                 #expect(isFinite(changed).all().item(Bool.self))
                 #expect(!allClose(original, changed, rtol: 1e-6, atol: 1e-6).item(Bool.self))
             }
         }
 
-        @Test("Gemma encodes one video frame like one image")
-        func videoFrameMatchesImage() throws {
+        @Test("Gemma encodes one video frame like one image", arguments: [true, false])
+        func videoFrameMatchesImage(tieWordEmbeddings: Bool) throws {
             try withMemoryLimit {
-                let model = Gemma4(try makeConfiguration())
+                let model = Gemma4(try makeConfiguration(tieWordEmbeddings: tieWordEmbeddings))
                 eval(model)
                 let pixels = MLXArray(0 ..< 48).reshaped([1, 3, 4, 4]).asType(.float32) / 48
                 let videoLogits = try logits(
@@ -54,8 +55,56 @@ extension MLXTestingSuite {
                 }
                 eval(output.logits)
 
+                #expect(output.logits.shape == [1, 1, 64])
                 #expect(
                     allClose(videoLogits, output.logits, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+            }
+        }
+
+        @Test("Gemma text callers retain every position", arguments: [true, false])
+        func textForwardRetainsEveryPosition(tieWordEmbeddings: Bool) throws {
+            try withMemoryLimit {
+                let model = Gemma4(try makeConfiguration(tieWordEmbeddings: tieWordEmbeddings))
+                eval(model)
+                let tokens = MLXArray([Int32(1), 2, 3, 4], [1, 4])
+                let full = model(tokens, cache: nil)
+                let single = model(MLXArray([Int32(1)], [1, 1]), cache: nil)
+                let prepared = try model.prepare(
+                    LMInput(tokens: tokens), cache: [], windowSize: nil)
+                guard case .logits(let output) = prepared else {
+                    Issue.record("Gemma did not return text logits.")
+                    return
+                }
+                eval(full, single, output.logits)
+
+                #expect(full.shape == [1, 4, 64])
+                #expect(single.shape == [1, 1, 64])
+                #expect(output.logits.shape == full.shape)
+                #expect(allClose(full, output.logits).item(Bool.self))
+            }
+        }
+
+        @Test("Gemma multimodal preparation reduces vocabulary allocation")
+        func multimodalPreparationReducesVocabularyAllocation() throws {
+            try withMemoryLimit {
+                let model = Gemma4(try makeConfiguration(vocabularySize: 8192))
+                eval(model)
+                var tokenValues = Array(repeating: Int32(1), count: 123)
+                tokenValues.append(contentsOf: Array(repeating: 61, count: 4))
+                tokenValues.append(2)
+                let tokens = MLXArray(tokenValues, [1, tokenValues.count])
+                let pixels = MLXArray.ones([1, 3, 4, 4])
+                eval(tokens, pixels)
+
+                let full = measuredAllocation { model(tokens, cache: nil) }
+                let prepared = try measuredAllocation {
+                    try logits(model, tokens: tokenValues, video: pixels)
+                }
+
+                #expect(full.shape == [1, 128, 8192])
+                #expect(prepared.shape == [1, 1, 8192])
+                #expect(full.bytes == 128 * prepared.bytes)
+                #expect(prepared.peakIncrease < full.peakIncrease)
             }
         }
 
@@ -79,12 +128,25 @@ extension MLXTestingSuite {
             let input = LMInput(
                 text: .init(tokens: MLXArray(tokens, [1, tokens.count])),
                 video: .init(pixels: video))
-            let result = try model.prepare(input, cache: [], windowSize: nil)
+            let cache = model.newCache(parameters: nil)
+            let result = try model.prepare(input, cache: cache, windowSize: nil)
             guard case .logits(let output) = result else {
                 throw CocoaError(.coderReadCorrupt)
             }
             eval(output.logits)
+            #expect(cache.allSatisfy { $0.offset == tokens.count })
             return output.logits
+        }
+
+        private func measuredAllocation(_ body: () throws -> MLXArray) rethrows -> (
+            shape: [Int], bytes: Int, peakIncrease: Int
+        ) {
+            Memory.clearCache()
+            let baseline = Memory.activeMemory
+            Memory.peakMemory = 0
+            let output = try body()
+            eval(output)
+            return (output.shape, output.nbytes, Memory.peakMemory - baseline)
         }
 
         private func withMemoryLimit(_ body: () throws -> Void) rethrows {
@@ -100,7 +162,9 @@ extension MLXTestingSuite {
             try body()
         }
 
-        private func makeConfiguration() throws -> Gemma4Configuration {
+        private func makeConfiguration(
+            tieWordEmbeddings: Bool = true, vocabularySize: Int = 64
+        ) throws -> Gemma4Configuration {
             let json = """
                 {
                   "model_type": "gemma4",
@@ -116,14 +180,15 @@ extension MLXTestingSuite {
                     "num_key_value_heads": 1,
                     "head_dim": 16,
                     "global_head_dim": 16,
-                    "vocab_size": 64,
+                    "vocab_size": \(vocabularySize),
                     "vocab_size_per_layer_input": 64,
                     "hidden_size_per_layer_input": 8,
                     "num_kv_shared_layers": 0,
                     "sliding_window": 64,
                     "sliding_window_pattern": 2,
                     "max_position_embeddings": 128,
-                    "use_double_wide_mlp": false
+                    "use_double_wide_mlp": false,
+                    "tie_word_embeddings": \(tieWordEmbeddings)
                   },
                   "vision_config": {
                     "num_hidden_layers": 1,

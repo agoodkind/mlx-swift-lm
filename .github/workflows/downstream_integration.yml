@@ -167,6 +167,7 @@ jobs:
       - name: Run tests without pretrained models
         working-directory: SwiftLM
         run: |
+          set -o pipefail
           status=0
           swift test --build-system native --jobs 4 --disable-swift-testing list --skip-build \
             > "$RUNNER_TEMP/swiftlm-tests.txt" 2> "$RUNNER_TEMP/swiftlm-discovery-errors.txt" || status=$?
@@ -184,8 +185,7 @@ jobs:
           done
           status=0
           swift test --build-system native --jobs 4 --disable-swift-testing --skip-build \
-            --filter "$SWIFTLM_TEST_FILTER" > "$RUNNER_TEMP/swiftlm-runtime.log" 2>&1 || status=$?
-          cat "$RUNNER_TEMP/swiftlm-runtime.log"
+            --filter "$SWIFTLM_TEST_FILTER" 2>&1 | tee "$RUNNER_TEMP/swiftlm-runtime.log" || status=$?
           if [[ "$status" -ne 0 ]]; then
             echo "::error::SwiftLM tests failed with exit status $status."
             exit "$status"

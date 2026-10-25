@@ -66,6 +66,18 @@ jobs:
         MLXLMTests/RotatingKVCacheRewindTests
         MLXLMTests/SpeculativeRoundRewindTests
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          test "$(env -u DEVELOPER_DIR xcode-select --print-path)" = "$DEVELOPER_DIR"
+          xcrun --kill-cache
+          SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - name: Validate exact source inputs
         run: |
           validate_ref() {
@@ -219,6 +231,18 @@ jobs:
     env:
       SWIFTLM_TEST_FILTER: 'SwiftLMTests\.(PromptCacheTests|MultimodalTokenExtractionTests|ChatRequestParsingTests|ThinkingTagStripTests|OwnFeatureHTTPTests)'
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          test "$(env -u DEVELOPER_DIR xcode-select --print-path)" = "$DEVELOPER_DIR"
+          xcrun --kill-cache
+          SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - name: Validate exact source inputs
         run: |
           validate_ref() {

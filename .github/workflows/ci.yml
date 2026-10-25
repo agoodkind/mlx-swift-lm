@@ -47,9 +47,25 @@ env:
   SWIFTLM_REF: ${{ inputs.swiftlm_ref || '4cc594d1cc6f88116f1509cee5ba5b6a1471f0be' }}
 
 jobs:
+  select_macos_runner:
+    name: Select macOS runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      label: ${{ steps.runner.outputs.label }}
+    steps:
+      - name: Use the shared macOS runner selector
+        id: runner
+        uses: agoodkind/swift-makefile/.github/actions/plan-runner@main
+        with:
+          runner: macos-26
+          capacity-token: ${{ secrets.LOCAL_POOL_CAPACITY_TOKEN }}
+
   build-and-test:
     name: Build and Test (macOS 26)
-    runs-on: macos-26
+    needs: select_macos_runner
+    if: ${{ always() }}
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
     timeout-minutes: 40
     env:
       LIBRARY_TEST_SUITES: |-
@@ -66,6 +82,18 @@ jobs:
         MLXLMTests/RotatingKVCacheRewindTests
         MLXLMTests/SpeculativeRoundRewindTests
     steps:
+      - name: Require successful macOS prerequisites
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          SELECTOR_RESULT: ${{ needs.select_macos_runner.result }}
+          SELECTED_RUNNER: ${{ needs.select_macos_runner.outputs.label }}
+        run: |
+          if [[ "$SELECTOR_RESULT" != 'success' || -z "$SELECTED_RUNNER" ]]; then
+            echo "::error::The macOS runner selector did not succeed or did not return a runner label."
+            exit 1
+          fi
+
       - name: Align Xcode and the runtime CPU compiler
         run: |
           sudo xcode-select --switch "$DEVELOPER_DIR"
@@ -117,9 +145,9 @@ jobs:
 
       - name: Set up Swift result verification
         id: maintenance
-        uses: agoodkind/lmd/.github/actions/setup-maintenance@426e79c9358c0d0d16f2b786acba7a93ffc9fc9c
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@763487338b00335c1dc9fb65d974d8d547519f85
         with:
-          ref: '426e79c9358c0d0d16f2b786acba7a93ffc9fc9c'
+          ref: '763487338b00335c1dc9fb65d974d8d547519f85'
 
       - name: Resolve the library dependency graph
         working-directory: mlx-swift-lm
@@ -219,11 +247,25 @@ jobs:
 
   integration-test:
     name: Build & Test SwiftLM Integration
-    runs-on: macos-26
+    needs: select_macos_runner
+    if: ${{ always() }}
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       SWIFTLM_TEST_FILTER: 'SwiftLMTests\.(PromptCacheTests|MultimodalTokenExtractionTests|ChatRequestParsingTests|ThinkingTagStripTests|OwnFeatureHTTPTests)'
     steps:
+      - name: Require successful macOS prerequisites
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          SELECTOR_RESULT: ${{ needs.select_macos_runner.result }}
+          SELECTED_RUNNER: ${{ needs.select_macos_runner.outputs.label }}
+        run: |
+          if [[ "$SELECTOR_RESULT" != 'success' || -z "$SELECTED_RUNNER" ]]; then
+            echo "::error::The macOS runner selector did not succeed or did not return a runner label."
+            exit 1
+          fi
+
       - name: Align Xcode and the runtime CPU compiler
         run: |
           sudo xcode-select --switch "$DEVELOPER_DIR"
@@ -306,9 +348,9 @@ jobs:
 
       - name: Set up Swift result verification
         id: maintenance
-        uses: agoodkind/lmd/.github/actions/setup-maintenance@426e79c9358c0d0d16f2b786acba7a93ffc9fc9c
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@763487338b00335c1dc9fb65d974d8d547519f85
         with:
-          ref: '426e79c9358c0d0d16f2b786acba7a93ffc9fc9c'
+          ref: '763487338b00335c1dc9fb65d974d8d547519f85'
 
       - name: Build SwiftLM and tests in Release
         working-directory: SwiftLM

@@ -42,7 +42,10 @@ package struct Qwen35CheckpointPolicy: Sendable {
         layout == .embedded ? Self.mtpComponent.excludedNamespaces : []
     }
 
-    package static func targetWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+    package static func targetWeights(
+        _ weights: [String: MLXArray], retainMTP: Bool = false
+    ) -> [String: MLXArray] {
+        if retainMTP { return weights }
         let mapping = CheckpointNameMapping(mtpComponent.namespaces.map { .excludePrefix($0) })
         return weights.filter { name, _ in mapping.mapName(name) != nil }
     }
@@ -54,7 +57,8 @@ package struct Qwen35CheckpointPolicy: Sendable {
     }
 
     package static func prepareTarget(
-        _ checkpoint: ModelCheckpoint, layout: TargetLayout, tiedWordEmbeddings: Bool
+        _ checkpoint: ModelCheckpoint, layout: TargetLayout, tiedWordEmbeddings: Bool,
+        retainMTP: Bool = false
     ) throws -> ModelCheckpoint {
         var rules = [CheckpointNameMapping.Rule]()
         if tiedWordEmbeddings { rules.append(.excludeModule("lm_head")) }
@@ -78,8 +82,14 @@ package struct Qwen35CheckpointPolicy: Sendable {
                 .replacePrefix("lm_head", with: "language_model.lm_head"),
             ]
         }
-        let selected = try mtpComponent.excluding(from: checkpoint)
-        return try selected.mapNames(using: .init(rules))
+        guard retainMTP else {
+            let selected = try mtpComponent.excluding(from: checkpoint)
+            return try selected.mapNames(using: .init(rules))
+        }
+        if layout == .wrappedText {
+            rules.append(.replacePrefix("mtp", with: "language_model.mtp"))
+        }
+        return try checkpoint.mapNames(using: .init(rules))
     }
 
     package func prepare(

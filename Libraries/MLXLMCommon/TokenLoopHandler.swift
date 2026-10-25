@@ -70,6 +70,8 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
 
     private static let logger = MLXLogger(label: "TokenStreamProtocol")
     private var decoder: any TokenStreamDecoder
+    private var currentToken = 0
+    private var currentLogProbability: Float = 0
     var cachedPromptTokenCount = 0
 
     public init(
@@ -90,7 +92,9 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
         logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending Generation) -> Bool
     ) -> TokenLoopDisposition {
-        process(token, emit: emit)
+        currentToken = token
+        currentLogProbability = logProbabilities?.materialize().chosen.logProbability ?? 0
+        return process(token, emit: emit)
     }
 
     public mutating func onStopToken(
@@ -99,6 +103,8 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
         emit: (sending Generation) -> Bool
     ) -> TokenLoopDisposition {
         guard decoder.receivesStopTokens else { return .more }
+        currentToken = token
+        currentLogProbability = logProbabilities?.materialize().chosen.logProbability ?? 0
         return process(token, emit: emit)
     }
 
@@ -153,7 +159,7 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
             return .more
 
         case .response(let response):
-            if !emit(.chunk(response)) {
+            if !emit(.chunk(response, tokenId: currentToken, logprob: currentLogProbability)) {
                 return .cancelled
             }
             return .more

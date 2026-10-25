@@ -44,7 +44,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     var fullAttentionInterval: Int = 4
     var layerTypes: [String]?
     var resolvedLayerTypes: [String] = []
-    var mtpNumHiddenLayers: Int = 0
+    public var mtpNumHiddenLayers: Int = 0
     var mtpUseDedicatedEmbeddings: Bool = false
 
     // MoE fields
@@ -57,7 +57,6 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
     // MTP fields
     public var numNextnPredictLayers: Int = 0
-    public var mtpNumHiddenLayers: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -91,7 +90,6 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         case moeIntermediateSize = "moe_intermediate_size"
         case normTopkProb = "norm_topk_prob"
         case numNextnPredictLayers = "num_nextn_predict_layers"
-        case mtpNumHiddenLayers = "mtp_num_hidden_layers"
     }
 
     public init(from decoder: Decoder) throws {
@@ -156,8 +154,9 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
         self.normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? true
         
-        let mtpLayers = try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
-        self.numNextnPredictLayers = try container.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers) ?? mtpLayers
+        self.numNextnPredictLayers =
+            try container.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers)
+            ?? mtpNumHiddenLayers
 
         let ropeContainer = try decoder.container(keyedBy: RopeParametersCodingKey.self)
         let ropeParameters = try ropeContainer.decodeIfPresent(
@@ -698,7 +697,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         // Decode (S == 1) runs through a compiled trace: fusion merges the
         // elementwise chains into fewer kernels, bit-identically. Prefill
         // stays unfused — it is GEMM-bound and would pay a trace per shape.
-        if x.dim(1) != 1 {
+        if x.dim(1) != 1 || ExpertStreamingConfig.shared.isEnabled {
             return forward(x)
         }
         return compiledForward(self, x)
@@ -808,6 +807,17 @@ final class Qwen35DecoderLayer: Module {
             prefaultEvaluatable(self.linearAttn)
             prefaultEvaluatable(cache)
             // WE MUST NOT PREFAULT MOE EXPERTS TO AVOID MEMORY CRASH
+        }
+
+        if x.dim(1) == 1, ssmMask == nil, positionOffset == nil,
+            checkpointAfter == nil, !ExpertStreamingConfig.shared.isEnabled
+        {
+            if isLinear, let mambaCache = cache as? MambaCache {
+                return decodeLinearLayer(x, cache: mambaCache)
+            }
+            if !isLinear, let cache, usesPlainAttentionCacheRoute(cache) {
+                return decodeAttentionLayer(x, mask: attentionMask, cache: cache)
+            }
         }
 
         let r: MLXArray
@@ -966,7 +976,7 @@ final class Qwen35DecoderLayer: Module {
 public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
     @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen35DecoderLayer]
+    let layers: [Qwen35DecoderLayer]
     let norm: MathRMSNorm
 
     let ssmIdx: Int?
@@ -1065,7 +1075,8 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts, cacheToEval: cacheArray?[i]) {
                 layer(
-                    hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+                    hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
+                    checkpointAfter: checkpointAfter)
             }
         }
 
@@ -1134,7 +1145,9 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
     /// everything else on a decode step is static-shaped, so the segments
     /// compile concretely.
     private func decodeStep(_ inputs: MLXArray, _ cache: [KVCache?]) -> MLXArray? {
-        guard cache.count == layers.count else { return nil }
+        guard cache.count == layers.count, gpuLayerCount == nil, !streamExperts,
+            !ExpertStreamingConfig.shared.isEnabled
+        else { return nil }
         // The schedule is only valid when the masks the general path would
         // build both come out empty.
         if let ssmIdx,
@@ -1206,8 +1219,12 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let faMask = faIdx.map {
+            createAttentionMask(h: hiddenStates, cache: cacheArray?[$0])
+        } ?? .none
+        let ssmMask = ssmIdx.flatMap {
+            createSSMMask(h: hiddenStates, cache: cacheArray?[$0] as? MambaCache)
+        }
 
         var captured = [Int: MLXArray]()
 
@@ -1346,7 +1363,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
         var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
-            checkpoint, layout: .text, tiedWordEmbeddings: configuration.tieWordEmbeddings)
+            checkpoint, layout: .text, tiedWordEmbeddings: configuration.tieWordEmbeddings,
+            retainMTP: MTPConfig.retainMTPWeights)
         checkpoint.weights = try sanitize(
             weights: checkpoint.weights, metadata: checkpoint.metadata)
         return checkpoint
@@ -1362,10 +1380,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // layout is the reliable signal on its own.
         let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        var weights = weights
-        if !MTPConfig.retainMTPWeights {
-            weights = weights.filter { !$0.key.contains("mtp.") }
-        }
+        var weights = Qwen35CheckpointPolicy.targetWeights(
+            weights, retainMTP: MTPConfig.retainMTPWeights)
 
         weights = filterLMHeadWeights(
             from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
@@ -1381,9 +1397,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         for k in Array(weights.keys) {
             guard let v = weights[k] else { continue }
             
-            // Map community MTP checkpoint keys (e.g. language_model.mtp.fc) to array indices (language_model.mtp.0.fc)
-            // Some checkpoints use .mtp.fc instead of the array index .mtp.0.fc
-            let updatedKey = k.contains(".mtp.") && !k.contains(".mtp.0.") ? k.replacingOccurrences(of: ".mtp.", with: ".mtp.0.") : k
+            // Add the head index only when the checkpoint omits it.
+            var components = k.split(separator: ".").map(String.init)
+            if let mtpIndex = components.firstIndex(of: "mtp"),
+                components.indices.contains(mtpIndex + 1),
+                Int(components[mtpIndex + 1]) == nil
+            {
+                components.insert("0", at: mtpIndex + 1)
+            }
+            let updatedKey = components.joined(separator: ".")
             let updatedVal = v
             
             if updatedKey != k {
@@ -1483,11 +1505,19 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
         var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
             checkpoint, layout: .wrappedText,
-            tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
+            tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings,
+            retainMTP: MTPConfig.retainMTPWeights)
         checkpoint.weights = try sanitize(
             weights: checkpoint.weights, metadata: checkpoint.metadata)
         return checkpoint
     }
+
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        let checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            .init(weights: weights), layout: .wrappedText,
+            tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings,
+            retainMTP: MTPConfig.retainMTPWeights)
+        var sanitized = checkpoint.weights
 
         // FP8 block-wise dequantization for Qwen3.6-27B-FP8 (dense checkpoint).
         // Official FP8 checkpoints ship each weight tensor alongside a
@@ -1640,3 +1670,20 @@ extension Qwen35TextModel: MTPLanguageModel {
     }
 }
 
+
+extension Qwen35Model: SpeculativeCacheRewindModel {
+    public var maximumNativeTargetCacheRewind: Int { 1 }
+}
+
+// MARK: - Chat conventions
+
+// `Qwen35MoEModel` subclasses `Qwen35Model` and inherits both declarations.
+extension Qwen35Model {
+    public var toolCallFormat: ToolCallFormat? { .qwen35 }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+}
+
+extension Qwen35TextModel {
+    public var toolCallFormat: ToolCallFormat? { .qwen35 }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+}

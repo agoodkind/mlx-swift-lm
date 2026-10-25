@@ -156,9 +156,12 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
-            return GemmaFunctionParser()
+            return GemmaFunctionParser(
+                startTag: "<start_function_call>", endTag: "<end_function_call>",
+                escapeMarker: "<escape>")
         case .gemma4:
-            return Gemma4FunctionParser()
+            return GemmaFunctionParser(
+                startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: "<|\"|>")
         case .kimiK2:
             return KimiK2ToolCallParser()
         case .minimaxM2:
@@ -267,11 +270,15 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         }
     }
 
-        // Gemma / Gemma 4
-        if type.hasPrefix("gemma4") {
-            return .gemma4
-        } else if type.hasPrefix("gemma") {
-            return .gemma
+    /// Generate an ID compatible with this tool-call syntax.
+    func generateToolCallID() -> String {
+        let uuid = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+
+        switch self {
+        case .mistral:
+            return String(uuid.prefix(9))
+        default:
+            return "call_" + uuid.lowercased()
         }
     }
 }

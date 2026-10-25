@@ -18,6 +18,7 @@ struct Gemma4TextTests {
             config.intermediateSize = 128
             config.tieWordEmbeddings = tiedEmbeddings
             config.finalLogitSoftcapping = 7.25
+            let softcap = try #require(config.finalLogitSoftcapping)
             let model = Gemma4TextModel(config)
             model.apply { $0.dtype.isFloatingPoint ? $0.asType(dtype) : $0 }
             if quantized { quantize(model: model, groupSize: 32, bits: 4) }
@@ -31,8 +32,7 @@ struct Gemma4TextTests {
                 let hidden = model.model(input, cache: expectedCache)
                 let logits = model.lmHead?(hidden) ?? model.model.embedTokens.asLinear(hidden)
                 let expected =
-                    tanh(logits / config.finalLogitSoftcapping)
-                    * config.finalLogitSoftcapping
+                    tanh(logits / softcap) * softcap
                 #expect(actual.dtype == expected.dtype)
                 #expect(actual.shape == expected.shape)
                 #expect(

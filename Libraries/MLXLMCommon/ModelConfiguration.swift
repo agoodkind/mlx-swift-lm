@@ -101,18 +101,27 @@ public struct ModelConfiguration: Sendable {
     /// Additional tokens to use for end of string (specified as strings, converted to IDs at runtime)
     public var extraEOSTokens: Set<String>
 
-    /// EOS token IDs used during generation.
+    /// Text sequences that stop decoded generation when encountered.
     ///
-    /// At load time this set is populated by merging:
-    /// - IDs from the model's `config.json` / `generation_config.json` (loaded at runtime)
-    /// - Any additional IDs provided by the registry / caller at registration time
-    ///   (e.g. `eosTokenIds: [0]` in ``LLMRegistry`` for Gemma-4 pad-token workaround)
+    /// If this is `nil`, decoded stop strings fall back to ``extraEOSTokens``.
+    /// Set this explicitly, including to an empty set, to override that fallback.
+    public var stopStrings: Set<String>?
+
+    /// Text sequences to use for decoded stop-string matching.
+    public var effectiveStopStrings: Set<String> {
+        stopStrings ?? extraEOSTokens
+    }
+
+    /// EOS token IDs loaded from config.json/generation_config.json
     public var eosTokenIds: Set<Int> = []
 
     /// Tool call format for this model (nil = default JSON format)
     public var toolCallFormat: ToolCallFormat?
 
-    /// If true, model weights are loaded lazily via mmap and not evaluated during loading.
+    /// Reasoning (chain-of-thought) protocol for this model (nil = non-reasoning model)
+    public var reasoningConfig: ReasoningConfig? = nil
+
+    /// Load weights through memory mapping without evaluating them during loading.
     public var lazyLoad: Bool = false
 
     /// How to choose which safetensors files in the model directory hold the model's weights.
@@ -145,8 +154,11 @@ public struct ModelConfiguration: Sendable {
         tokenizerSource: TokenizerSource? = nil,
         defaultPrompt: String = "",
         extraEOSTokens: Set<String> = [],
+        stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
+        reasoningConfig: ReasoningConfig? = nil,
+        messageGenerator: (any MessageGenerator)? = nil,
         preparePrompt: (@Sendable (String) -> String)? = nil,
         lazyLoad: Bool = false
     ) {
@@ -154,8 +166,11 @@ public struct ModelConfiguration: Sendable {
         self.tokenizerSource = tokenizerSource
         self.defaultPrompt = defaultPrompt
         self.extraEOSTokens = extraEOSTokens
+        self.stopStrings = stopStrings
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
+        self.reasoningConfig = reasoningConfig
+        self.messageGenerator = messageGenerator
         self.lazyLoad = lazyLoad
     }
 
@@ -167,6 +182,8 @@ public struct ModelConfiguration: Sendable {
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
+        reasoningConfig: ReasoningConfig? = nil,
+        messageGenerator: (any MessageGenerator)? = nil,
         lazyLoad: Bool = false
     ) {
         self.id = .directory(directory)
@@ -176,6 +193,8 @@ public struct ModelConfiguration: Sendable {
         self.stopStrings = stopStrings
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
+        self.reasoningConfig = reasoningConfig
+        self.messageGenerator = messageGenerator
         self.lazyLoad = lazyLoad
     }
 
@@ -196,6 +215,10 @@ public struct ModelConfiguration: Sendable {
             stopStrings: stopStrings,
             eosTokenIds: eosTokenIds,
             toolCallFormat: toolCallFormat,
+            reasoningConfig: reasoningConfig,
+            messageGenerator: messageGenerator,
+            weightFileSelection: weightFileSelection,
+            excludedComponents: excludedComponents,
             lazyLoad: lazyLoad)
     }
 
@@ -216,6 +239,7 @@ extension ModelConfiguration: Equatable {
             && lhs.reasoningConfig == rhs.reasoningConfig
             && lhs.weightFileSelection == rhs.weightFileSelection
             && lhs.excludedComponents == rhs.excludedComponents
+            && lhs.lazyLoad == rhs.lazyLoad
             && sameMessageGenerator(lhs.messageGenerator, rhs.messageGenerator)
     }
 

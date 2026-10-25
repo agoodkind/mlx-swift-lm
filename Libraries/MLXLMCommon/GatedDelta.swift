@@ -365,7 +365,8 @@ public func gatedDeltaUpdate(
     }
 
     let isCPU = Device.defaultDevice().deviceType == .cpu
-    if !isCPU, GatedDeltaKernelManager.shared.kernel != nil {
+    // The Metal kernel requires 32 key dimensions per SIMD group and cannot compute gradients.
+    if !isCPU, useKernel, Dk % 32 == 0, GatedDeltaKernelManager.shared.kernel != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 

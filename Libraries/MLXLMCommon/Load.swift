@@ -163,15 +163,21 @@ func loadWeightArrays(urls: [URL]) throws -> (
 
 /// Tensors under `excludedNamespaces` are never read. A file that holds only excluded tensors
 /// still supplies its metadata.
-func loadModelCheckpoint(urls: [URL], excludedNamespaces: [String] = []) throws
+func loadModelCheckpoint(
+    urls: [URL], excludedNamespaces: [String] = [], materialize: Bool = true
+) throws
     -> ModelCheckpoint
 {
     let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
-    return try loadModelCheckpoint(urls: urls) { exclusions.mapName($0) != nil }
+    return try loadModelCheckpoint(urls: urls, materialize: materialize) {
+        exclusions.mapName($0) != nil
+    }
 }
 
 /// Only tensors whose names pass `isRead` are read.
-func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bool) throws
+func loadModelCheckpoint(
+    urls: [URL], materialize: Bool = true, isRead: @escaping @Sendable (String) -> Bool
+) throws
     -> ModelCheckpoint
 {
     struct WorkItem {
@@ -233,7 +239,7 @@ func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bo
                 }
 
                 // force this range's I/O here, on this stream, in file-offset order
-                if !selected.isEmpty { eval(Array(selected.values)) }
+                if materialize && !selected.isEmpty { eval(Array(selected.values)) }
                 state.merge(file: item.file, weights: selected, metadata: metadata)
             }
         } catch {
@@ -400,7 +406,10 @@ public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    lazyLoad: Bool = false
+    lazyLoad: Bool = false,
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse
 ) throws {
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
     let weightURLs = try safetensorWeightURLs(
@@ -415,77 +424,66 @@ public func loadWeights(
             of: model, urls: weightURLs, excluded: excludedComponents,
             loading: componentLoading, perLayerQuantization: perLayerQuantization)
         + model.excludedCheckpointNamespaces
+    let streaming = ExpertStreamingConfig.shared.isEnabled
     var checkpoint = try loadModelCheckpoint(
-        urls: weightURLs, excludedNamespaces: excludedNamespaces)
+        urls: weightURLs, excludedNamespaces: excludedNamespaces,
+        materialize: !lazyLoad && !streaming)
     checkpoint.perLayerQuantization = perLayerQuantization
     checkpoint = try model.prepareCheckpoint(checkpoint)
-    try applyCheckpoint(checkpoint, to: model)
 
-    // Build derived inference-only state and realize the model while the loader
-    // still has exclusive access. Forward passes must remain read-only.
-    materializeModelForInference(model)
-}
-
-    // ExpertStreamingConfig: Initialize the ExpertStreamerManager when streaming is active.
-    // On macOS: pread() from NVMe at ~5 GB/s.
-    // On iOS:   mmap page-cache from APFS at ~2-3 GB/s — same struct, different bandwidth.
-    if ExpertStreamingConfig.shared.isEnabled {
+    if streaming {
         ExpertStreamerManager.shared = ExpertStreamerManager(modelDirectory: modelDirectory)
     }
 
-    // quantize if needed
-    if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    let dict = perLayerQuantization.perLayerQuantization
-                    if let opt = dict[path] ?? 
-                                 dict["language_model.\(path)"] ??
-                                 dict[path.replacingOccurrences(of: ".experts.router.", with: ".router.")] ??
-                                 dict["language_model." + path.replacingOccurrences(of: ".experts.router.", with: ".router.")] {
-                        switch opt {
-                        case .skip: return nil
-                        case .quantize(let q): return q.asTuple
-                        }
-                    }
-                    return perLayerQuantization.quantization?.asTuple
-                } else {
-                    return quantization?.asTuple
-                }
-            } else {
-                return nil
-            }
-        }
+    var stackedScales = [String: MLXArray]()
+    for key in checkpoint.weights.keys
+    where key.contains(".switch_mlp.") && key.hasSuffix(".weight_scale_inv") {
+        stackedScales[key] = checkpoint.weights.removeValue(forKey: key)
     }
-    try module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+
+    try applyCheckpoint(checkpoint, to: model, allowMissingWeights: streaming)
+    if streaming {
+        configureStreamingWeights(in: model, stackedScales: stackedScales)
+    }
+
+    if lazyLoad {
+        prepareInferenceState(in: model)
+    } else {
+        materializeModelForInference(model)
+    }
 }
 
-    // Extract weight_scale_inv for switch_mlp layers BEFORE update to avoid Unhandled Keys
-    var stackedScales = [String: MLXArray]()
-    for key in weights.keys {
-        if key.contains(".switch_mlp.") && key.hasSuffix(".weight_scale_inv") {
-            if let val = weights[key] {
-                stackedScales[key] = val
-                weights.removeValue(forKey: key)
+/// Quantize checkpoint layers and update their parameters.
+func applyCheckpoint(
+    _ checkpoint: ModelCheckpoint, to module: Module, allowMissingWeights: Bool = false
+) throws {
+    let weights = checkpoint.weights
+    if let perLayerQuantization = checkpoint.perLayerQuantization {
+        quantize(model: module) { path, _ in
+            guard weights["\(path).scales"] != nil else { return nil }
+            let settings = perLayerQuantization.perLayerQuantization
+            let routerPath = path.replacingOccurrences(of: ".experts.router.", with: ".router.")
+            if let option = settings[path] ?? settings["language_model.\(path)"]
+                ?? settings[routerPath] ?? settings["language_model.\(routerPath)"] {
+                switch option {
+                case .skip: return nil
+                case .quantize(let quantization): return quantization.asTuple
+                }
             }
+            return perLayerQuantization.quantization(layer: path)?.asTuple
         }
     }
-
-    // apply the loaded weights
-    // When SSD streaming is active, expert weights are intentionally absent from `weights`
-    // (they are paged from NVMe on demand). Using .all would reject the load.
-    // .noUnusedKeys still catches genuinely stray/misspelled keys without requiring
-    // every @ModuleInfo slot to be populated up-front.
     let parameters = ModuleParameters.unflattened(weights)
-    if ExpertStreamingConfig.shared.isEnabled {
-        // Expert weights are intentionally absent — paged from SSD on demand.
-        // .noUnusedKeys still rejects stray/misspelled keys without requiring
-        // every @ModuleInfo slot to be pre-populated.
-        try model.update(parameters: parameters, verify: .noUnusedKeys)
+    if allowMissingWeights {
+        try module.update(parameters: parameters, verify: .noUnusedKeys)
     } else {
-        try model.update(parameters: parameters, verify: .all)
+        try module.update(parameters: parameters, verify: .all)
     }
+}
 
+private func configureStreamingWeights(
+    in model: BaseLanguageModel, stackedScales: [String: MLXArray]
+) {
     if ExpertStreamingConfig.shared.isEnabled {
         // Assign tensorName to each QuantizedSwitchLinear.
         //
@@ -500,7 +498,6 @@ public func loadWeights(
         //
         // We probe the ExpertStreamerManager weight map with common VLM prefixes
         // and fall back to the bare path if none match.
-        let knownPrefixes = ["language_model.", "model.language_model.", ""]
         for (path, module) in model.leafModules().flattened() {
             if let sl = module as? SwitchLinear {
                 let bareName = "\(path).weight"
@@ -517,12 +514,10 @@ public func loadWeights(
                     let allPrefixes = ["", "model.", "language_model.", "model.language_model."]
                     let candidates = [expert0Name, stripped0Name, strippedMtpName] + allPrefixes.map { $0 + stripped0Name } + allPrefixes.map { $0 + strippedMtpName }
                     var foundUnstacked = false
-                    var matchedCandidate = ""
                     
                     for candidate in candidates {
                         if ExpertStreamerManager.shared?.getFile(for: candidate) != nil {
                             foundUnstacked = true
-                            matchedCandidate = candidate
                             var map = [Int: (path: String, tensorName: String)]()
                             for i in 0 ..< sl.numExperts {
                                 let c = candidate.replacingOccurrences(of: ".experts.0.", with: ".experts.\(i).")
@@ -568,7 +563,54 @@ public func loadWeights(
         }
     }
 
-    if !lazyLoad {
-        eval(model)
+}
+
+/// Load model weights without blocking a Swift concurrency thread.
+///
+/// Loading blocks its thread on file I/O and fans out with `DispatchQueue.concurrentPerform`.
+/// Swift concurrency's cooperative threads must never block, so this overload runs the load
+/// on a global queue and suspends the caller instead. Async callers resolve to this overload;
+/// the synchronous one remains for synchronous code such as model conversion.
+public func loadWeights(
+    modelDirectory: URL, model: BaseLanguageModel,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    lazyLoad: Bool = false,
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse
+) async throws {
+    let model = SendableBox(model)
+    try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, any Error>) in
+        DispatchQueue.global(qos: .userInitiated).async {
+            // The caller's withError does not reach this thread.
+            continuation.resume(
+                with: Result {
+                    try withLoaderThreadError {
+                        try loadWeights(
+                            modelDirectory: modelDirectory, model: model.consume(),
+                            quantization: quantization,
+                            perLayerQuantization: perLayerQuantization,
+                            lazyLoad: lazyLoad,
+                            weightFileSelection: weightFileSelection,
+                            excludedComponents: excludedComponents,
+                            componentLoading: componentLoading)
+                    }
+                })
+        }
+    }
+}
+
+/// Run `body` in an MLX error scope on the current thread. An MLX error is thrown
+/// in place of a later error it caused in `body`, such as a shape mismatch.
+func withLoaderThreadError<R>(_ body: () throws -> R) throws -> R {
+    try withError { mlxError in
+        do {
+            return try body()
+        } catch {
+            try mlxError.check()
+            throw error
+        }
     }
 }

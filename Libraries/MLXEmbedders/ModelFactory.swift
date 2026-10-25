@@ -178,7 +178,9 @@ public struct EmbedderModelContext {
 ///     progressHandler: logProgress(modelId)
 /// )
 /// ```
-public final class EmbedderModelFactory: @unchecked Sendable {
+public final class EmbedderModelFactory: GenericModelFactory {
+    public typealias ContextType = EmbedderModelContext
+    public typealias ContainerType = EmbedderModelContainer
 
     public init(
         typeRegistry: ModelTypeRegistry<EmbeddingModel>,
@@ -238,6 +240,7 @@ public final class EmbedderModelFactory: @unchecked Sendable {
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
+            lazyLoad: configuration.lazyLoad,
             weightFileSelection: configuration.weightFileSelection,
             excludedComponents: configuration.excludedComponents)
 
@@ -255,7 +258,8 @@ public final class EmbedderModelFactory: @unchecked Sendable {
             extraEOSTokens: configuration.extraEOSTokens,
             stopStrings: configuration.stopStrings,
             eosTokenIds: configuration.eosTokenIds,
-            toolCallFormat: configuration.toolCallFormat)
+            toolCallFormat: configuration.toolCallFormat,
+            lazyLoad: configuration.lazyLoad)
 
         let pooling = loadPooling(modelDirectory: modelDirectory, model: model)
 

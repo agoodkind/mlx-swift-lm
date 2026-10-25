@@ -638,46 +638,61 @@ public enum MediaProcessing {
     public static func extractAudioSamples(from audio: UserInput.Audio) throws -> [Float] {
         let url: URL
         var tempURL: URL? = nil
-        
-        switch audio {
+
+        switch audio.source {
+        case .array(let array):
+            guard array.ndim == 1 else {
+                throw VLMError.processing("Audio samples must use a one-dimensional mono array.")
+            }
+            return array.asType(.float32).asArray(Float.self)
         case .url(let u):
             url = u
         case .data(let data, let format):
-            let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension(format)
+            let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+                UUID().uuidString
+            ).appendingPathExtension(format)
             try data.write(to: fileURL)
             url = fileURL
             tempURL = fileURL
         }
-        
+
         defer {
             if let tempURL = tempURL {
                 try? FileManager.default.removeItem(at: tempURL)
             }
         }
-        
+
         let file = try AVAudioFile(forReading: url)
-        let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000.0, channels: 1, interleaved: false)!
-        
+        let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: 16000.0, channels: 1, interleaved: false)!
+
         let frameCount = AVAudioFrameCount(file.length)
-        let sourceBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frameCount)!
+        let sourceBuffer = AVAudioPCMBuffer(
+            pcmFormat: file.processingFormat, frameCapacity: frameCount)!
         try file.read(into: sourceBuffer)
-        
-        let convertedFrameCapacity = AVAudioFrameCount(Double(frameCount) * (targetFormat.sampleRate / file.processingFormat.sampleRate)) + 1024
-        let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: convertedFrameCapacity)!
-        
+
+        let convertedFrameCapacity =
+            AVAudioFrameCount(
+                Double(frameCount) * (targetFormat.sampleRate / file.processingFormat.sampleRate))
+            + 1024
+        let convertedBuffer = AVAudioPCMBuffer(
+            pcmFormat: targetFormat, frameCapacity: convertedFrameCapacity)!
+
         guard let converter = AVAudioConverter(from: file.processingFormat, to: targetFormat) else {
-            throw NSError(domain: "MediaProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create AVAudioConverter"])
+            throw NSError(
+                domain: "MediaProcessing", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to create AVAudioConverter"])
         }
-        
+
         final class AudioBufferState: @unchecked Sendable {
             var hasRead = false
             let source: AVAudioPCMBuffer
             init(source: AVAudioPCMBuffer) { self.source = source }
         }
-        
+
         let state = AudioBufferState(source: sourceBuffer)
         var error: NSError?
-        
+
         converter.convert(to: convertedBuffer, error: &error) { inNumPackets, outStatus in
             if state.hasRead {
                 outStatus.pointee = .endOfStream
@@ -687,16 +702,19 @@ public enum MediaProcessing {
             outStatus.pointee = .haveData
             return state.source
         }
-        
+
         if let error = error {
             throw error
         }
-        
+
         guard let channelData = convertedBuffer.floatChannelData else {
-            throw NSError(domain: "MediaProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to extract channel data"])
+            throw NSError(
+                domain: "MediaProcessing", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to extract channel data"])
         }
-        
-        let samples = Array(UnsafeBufferPointer(start: channelData[0], count: Int(convertedBuffer.frameLength)))
+
+        let samples = Array(
+            UnsafeBufferPointer(start: channelData[0], count: Int(convertedBuffer.frameLength)))
         return samples
     }
 }

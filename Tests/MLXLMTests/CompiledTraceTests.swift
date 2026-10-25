@@ -79,14 +79,13 @@ final class CompiledTraceTests: XCTestCase {
         return array.item(Float.self)
     }
 
-    /// The hazard, straight from MLX: a body that reads weights through a
-    /// capture keeps the values of its first call. Reproducing it takes
-    /// `MLX.compile` by name, since the `compile` this package exposes rejects
-    /// the capture at build time. A failure here means MLX changed its capture
-    /// rules and `CompiledTrace` can be revisited.
+    /// Explicit state selects the core overload that permits module captures.
+    /// The trace uses the first weight values when its state omits those weights.
     func testPlainCompileFreezesCapturedWeights() {
         let layer = ScaleLayer(2)
-        let captured = MLX.compile { [unowned layer] (x: MLXArray) in layer.forward(x) }
+        let captured = MLX.compile(inputs: [], outputs: []) {
+            [unowned layer] (x: MLXArray) in layer.forward(x)
+        }
 
         XCTAssertEqual(value(captured(MLXArray([Float(1)]))), 2)
 
@@ -183,7 +182,7 @@ final class CompiledTraceTests: XCTestCase {
     }
 
     func testCompileRunsBodyWithoutState() {
-        let f = compile(shapeless: true) { (a: MLXArray, b: MLXArray) in a * b + 1 }
+        let f = MLXLMCommon.compile(shapeless: true) { (a: MLXArray, b: MLXArray) in a * b + 1 }
         XCTAssertEqual(value(f(MLXArray([Float(2)]), MLXArray([Float(3)]))), 7)
     }
 }

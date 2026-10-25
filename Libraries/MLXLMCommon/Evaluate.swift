@@ -26,7 +26,7 @@ public protocol LogitSampler {
 ///
 /// ```swift
 /// logits = processor?.process(logits: logits) ?? logits
-/// let y = sampler.sample(logits: logits); print("GENERATED TOKEN INNER: ", y.item(Int.self))
+/// let y = sampler.sample(logits: logits)
 /// processor?.didSample(token: y)
 /// ```
 ///
@@ -532,16 +532,9 @@ struct TokenRing {
     }
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
-    ///
-    /// The prompt may arrive 1-D (`[N]`) or 2-D (`[1, N]` — how VLM prefill
-    /// supplies `input.text.tokens`). We flatten to 1-D first so `dim(0)`
-    /// reflects the true token count. Without this, a 2-D `[1, N]` is read as
-    /// `n = 1`, the `n < capacity` branch fires with a bogus count, and a
-    /// later `append(...)` crashes at `[broadcast_shapes] Shapes (capacity)
-    /// and (N + capacity - 1) cannot be broadcast`.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let promptTokens = prompt.asType(.int32).reshaped(-1)
-        let n = promptTokens.dim(0)
+        let promptTokens = prompt.asType(.int32).flattened()
+        let n = promptTokens.count
         if n <= capacity {
             if n < capacity {
                 let padding = MLXArray.zeros([capacity - n], type: Int32.self)
@@ -761,12 +754,41 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var maxTokens: Int? { get }
     var tokenCount: Int { get }
     var promptPrefillTime: TimeInterval { get }
+    var state: LMOutput.State? { get }
+    var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { get }
+    var lastLogProbabilities: DeferredTokenLogProbabilities? { get }
+    var evictedTokenCount: Int { get }
+    var reasoningTokenCount: Int? { get }
     var streamingError: SSDStreamingError? { get }
     var acceptedDraftTokens: Int { get }
     var totalDraftTokens: Int { get }
-
-    /// Log-probability of the token most recently returned by `next()`.
     var lastLogprob: Float { get }
+
+    /// Records a token included in the generated completion.
+    mutating func recordEmittedToken(_ token: Int)
+    mutating func discardGeneratedToken()
+}
+
+/// Internal lifecycle capability for iterators that retain generation work
+/// which must be reconciled after the token loop stops.
+protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
+    mutating func finalizeGeneration()
+}
+
+extension TokenIteratorProtocol {
+    public var streamingError: SSDStreamingError? { nil }
+    public var acceptedDraftTokens: Int {
+        speculativeDecodingTelemetry?.acceptedDraftTokenCount ?? 0
+    }
+    public var totalDraftTokens: Int { speculativeDecodingTelemetry?.draftTokenCount ?? 0 }
+    public var lastLogprob: Float { lastLogProbabilities?.materialize().chosen.logProbability ?? 0 }
+    public var state: LMOutput.State? { nil }
+    public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { nil }
+    public var lastLogProbabilities: DeferredTokenLogProbabilities? { nil }
+    public var evictedTokenCount: Int { 0 }
+    public var reasoningTokenCount: Int? { nil }
+    public mutating func recordEmittedToken(_ token: Int) {}
+    public mutating func discardGeneratedToken() {}
 }
 
 /// Normalized logits shared by reporting and filtered sampling.
@@ -915,17 +937,11 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     var kvCachePlan: KVCachePlan { cacheStorage.plan }
 
-    // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
-    var streamingError: SSDStreamingError?
-    let ssdErrorLatch = SSDStreamingErrorLatch()
-    var acceptedDraftTokens = 0
-    var totalDraftTokens = 0
+    public private(set) var streamingError: SSDStreamingError?
+    private let ssdErrorLatch = SSDStreamingErrorLatch()
 
-    /// Log-probability of the token most recently returned by `next()`.
-    public var lastLogprob: Float = 0
-    /// Log-probability of the current `y` (the token `next()` will return next).
-    private var yLogprob: Float = 0
+    // Internal metrics
+    public var promptPrefillTime: TimeInterval = 0.0
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:state:parameters:components:)``.
@@ -995,7 +1011,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         try components.validate(parameters: parameters)
         self.processor = components.logitProcessor(parameters: parameters, model: model)
         self.sampler = parameters.sampler()
-        self.logProbabilityTopK = parameters.logProbabilities.map { Swift.max($0, 0) }
+        self.logProbabilityTopK = Swift.max(parameters.logProbabilities ?? 0, 0)
         self.maxTokens = parameters.maxTokens
 
         self.promptPrefillTime = try measure {
@@ -1030,7 +1046,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.processor = processor
         self.sampler = sampler
-        self.logProbabilityTopK = nil
+        self.logProbabilityTopK = 0
         self.maxTokens = maxTokens
 
         self.promptPrefillTime = try measure {
@@ -1056,10 +1072,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             prefill: .init(stepSize: prefillStepSize), maxTokens: maxTokens)
     }
 
-        let preparation = try SSDStreamingErrorLatch.withActive(ssdErrorLatch) {
-            try model.prepare(input, cache: cache, windowSize: windowSize)
-        }
+    mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
+        processor?.prompt(input.text.tokens)
+        prefill.prefix?(cacheStorage.processedTokenCount)
+        let inputLength = input.text.cacheSequenceLength
 
+        let preparation = try SSDStreamingErrorLatch.withActive(ssdErrorLatch) {
+            try model.prepare(input, cache: cache, state: state, prefill: prefill)
+        }
+        try ssdErrorLatch.throwIfSet()
         switch preparation {
         case .tokens(let tokens):
             let remainingLength = tokens.cacheSequenceLength
@@ -1069,11 +1090,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             cacheStorage.commitProcessedTokens(inputLength - remainingLength)
             y = tokens
 
-            try ssdErrorLatch.throwIfSet()
-
             // evaluate the remainder of the prompt -- this primes the pump
             let token = try step(previous: y)
-
             y = .init(tokens: token)
             evaluateTokenAndLogProbabilities(y.tokens)
 
@@ -1083,8 +1101,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             prefill.progress?(total, total)
 
         case .logits(let result):
-            try ssdErrorLatch.throwIfSet()
-
+            cacheStorage.commitProcessedTokens(inputLength)
+            // carry the prefill state into decode, as step(previous:) does for later steps
+            self.state = result.state
             y = .init(tokens: convertToToken(logits: result.logits))
             evaluateTokenAndLogProbabilities(y.tokens)
 
@@ -1115,10 +1134,6 @@ public struct TokenIterator: TokenIteratorProtocol {
             y = sampler.sample(logits: logits)
         }
 
-        // Chosen-token log-probability from the processed logits (OpenAI-style
-        // logprobs): logSoftmax over the full vocab, gathered at the sampled token.
-        yLogprob = takeAlong(logSoftmax(logits), y.reshaped([1, 1]), axis: -1).item(Float.self)
-
         processor?.didSample(token: y)
 
         return y
@@ -1135,11 +1150,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) throws -> MLXArray {
         let result = SSDStreamingErrorLatch.withActive(ssdErrorLatch) {
-            model(previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+            withPreparedCache(cache, lengths: previous.sequenceLengths) {
+                model.nextTokenLogits(
+                    previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+            }
         }
-        self.state = result.state
-
         try ssdErrorLatch.throwIfSet()
+        cacheStorage.commitProcessedTokens(previous.cacheSequenceLength)
+        self.state = result.state
 
         // Apply dynamic cache quantization after each step
         kvCachePlan.apply(to: cacheStorage)
@@ -1148,38 +1166,55 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
-        if streamingError != nil {
-            return nil
-        }
-
+        guard streamingError == nil else { return nil }
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
 
-        // save current value -- this will be returned
-        let previousY = y
-        // logprob of the token being returned, captured before step() overwrites yLogprob
-        let previousLogprob = yLogprob
+        // Drain autoreleased MLX temporaries every step: a full model forward
+        // produces hundreds of autoreleased wrapper objects, and the token
+        // loop never returns to a pool boundary on its own; without this,
+        // long generations grow host memory without bound.
+        return autoreleasepool {
+            // save current value -- this will be returned
+            let previousY = y
+            let previousLogProbabilities = deferredLogProbabilities
 
-        // compute the next state and async eval the next token
-        let token: MLXArray
-        do {
-            token = try step(previous: previousY)
-        } catch let error as SSDStreamingError {
-            streamingError = error
-            return nil
-        } catch {
-            streamingError = SSDStreamingError(underlyingError: error)
-            return nil
-        }
+            // compute the next state and async eval the next token
+            let token: MLXArray
+            do {
+                token = try step(previous: previousY)
+            } catch let error as SSDStreamingError {
+                streamingError = error
+                return nil
+            } catch {
+                streamingError = SSDStreamingError(underlyingError: error)
+                return nil
+            }
+            y = .init(tokens: token)
+            // Evaluate the cache state together with the token: caches update
+            // through functional ops (concatenation, slice assignment), and an
+            // unevaluated chain of those updates keeps every prior step's
+            // intermediates alive. Python mlx-lm settles cache state the same
+            // way in its generation loop.
+            if let deferredLogProbabilities {
+                asyncEval([token] + cache.flatMap { $0.state } + deferredLogProbabilities.arrays)
+            } else {
+                asyncEval([token] + cache.flatMap { $0.state })
+            }
 
-        y = .init(tokens: token)
-        asyncEval(token)
+            // Periodically return freed buffers that cannot be reused (odd or
+            // monotonically growing sizes accumulate in the pool otherwise).
+            // Matches mlx-lm, which also clears on the first token, after prefill.
+            if tokenCount % 256 == 0 {
+                MLX.Memory.clearCache()
+            }
 
             tokenCount += 1
 
-        lastLogprob = previousLogprob
-        return previousY.tokens.item(Int.self)
+            lastLogProbabilities = previousLogProbabilities
+            return previousY.tokens.item(Int.self)
+        }
     }
 
     public mutating func recordEmittedToken(_ token: Int) {
@@ -1226,11 +1261,27 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     let mainModel: any LanguageModel
     let draftModel: any LanguageModel
 
-    var mainState: LMOutput.State?
-    public let streamingError: SSDStreamingError? = nil
-    var mainCache: [KVCache]
-    var draftCache: [KVCache]
-    let quantizeKVCache: (inout [KVCache]) -> Void
+    /// Model state carried by the main model, as ``TokenIterator/state``.
+    ///
+    /// Seeded from `mainState` and updated by prefill and each verification pass. Read it from
+    /// the same iterator value you generate with: this is a struct, so a copy would not observe
+    /// later mutations.
+    ///
+    /// > Note: a rejected proposal trims KV rows, so only state a decode step does not rewrite
+    /// > survives speculation. The vision models' M-RoPE anchors qualify — they position from the
+    /// > cache offset, which the same trim rewinds.
+    public internal(set) var state: LMOutput.State?
+    let mainCacheStorage: KVCacheStorage
+    let draftCacheStorage: KVCacheStorage
+    var mainCache: [KVCache] {
+        get { mainCacheStorage.cache }
+        set { mainCacheStorage.replace(with: newValue) }
+    }
+    var draftCache: [KVCache] {
+        get { draftCacheStorage.cache }
+        set { draftCacheStorage.replace(with: newValue) }
+    }
+    var kvCachePlan: KVCachePlan { mainCacheStorage.plan }
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
@@ -1255,13 +1306,27 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     private(set) var passthroughReason: String?
 
     // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
-    var acceptedDraftTokens = 0
-    var totalDraftTokens = 0
+    public var promptPrefillTime: TimeInterval = 0.0
+    private var telemetry = SpeculativeDecodingTelemetry()
+    public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? {
+        telemetry.roundCount > 0 ? telemetry : nil
+    }
 
-    /// Log-probability of the token most recently returned by `next()`.
-    /// Speculative decoding does not currently compute per-token logprobs.
-    public var lastLogprob: Float = 0
+    public var evictedTokenCount: Int {
+        KVCacheTree.leaves(in: mainCache).map(\.cache.evictedTokenCount).max() ?? 0
+    }
+
+    public var reasoningTokenCount: Int? {
+        (processor as? any GenerationReasoningTokenCounting)?.generationReasoningTokenCount
+    }
+
+    public mutating func recordEmittedToken(_ token: Int) {
+        processor?.didEmit(token: token)
+    }
+
+    public mutating func discardGeneratedToken() {
+        telemetry.discardGeneratedToken()
+    }
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -1455,7 +1520,6 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        // Checkpoint Mamba caches before speculation (for rollback on rejection)
         for layer in mainCache {
             if let mamba = layer as? MambaCache { mamba.checkpoint() }
         }
@@ -1464,6 +1528,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         var draftProcessor = processor?.copy()  // Copy to discard later
         var draftTokens = [MLXArray]()
         var draftProcessedLogits = [MLXArray]()
+        var draftState: LMOutput.State?
         for _ in 0 ..< numDraft {
             let draftResult = draftModel(
                 draftY[text: .newAxis], cache: draftCache, state: draftState)
@@ -1495,7 +1560,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
         let mainTokens: MLXArray
         var mainProcessedLogits = [MLXArray]()
-        if var verifyProcessor = processor {
+        if var verifyProcessor = processor?.copy() {
             // Process each position sequentially so that the processor sees tokens sampled at earlier positions
             var sampled = [MLXArray]()
             for i in 0 ..< (numDraft + 1) {
@@ -1511,18 +1576,19 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             // Batch-sample all verify tokens from main model in one operation
             let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
             mainTokens = sampler.sample(logits: verifyLogits)
-            for i in 0 ..< (numDraft + 1) {
-                mainProcessedLogits.append(verifyLogits[i ..< i + 1])
+            for index in 0 ..< (numDraft + 1) {
+                mainProcessedLogits.append(verifyLogits[index ..< index + 1])
             }
         }
 
         // Compare and accept proposed tokens
+        eval(mainTokens, draftTokens)
         let mainTokensList = mainTokens.asArray(Int.self)
         let draftTokensList = concatenated(draftTokens).asArray(Int.self)
         var accepted = 0
         let temp = parameters.temperature
         let finalTokenOut: MLXArray
-        
+
         if temp == 0.0 {
             // Greedy Decoding (Exact Match = Rejection Sampling at temp 0)
             for i in 0 ..< numDraft {
@@ -1541,12 +1607,12 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             var finalToken: MLXArray? = nil
             for i in 0 ..< numDraft {
                 let x = draftTokensList[i]
-                
+
                 // Force evaluation of distributions for this step
                 let pTarget = MLX.softmax(mainProcessedLogits[i] / temp, axis: -1)
                 let pDraft = MLX.softmax(draftProcessedLogits[i] / temp, axis: -1)
                 eval(pTarget, pDraft)
-                
+
                 // Access scalar probability (assuming logits are [1, Vocab] or [Vocab])
                 let pTargetX: Float
                 let pDraftX: Float
@@ -1557,10 +1623,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
                     pTargetX = pTarget[x].item(Float.self)
                     pDraftX = pDraft[x].item(Float.self)
                 }
-                
+
                 let acceptProb = Swift.min(1.0, pTargetX / Swift.max(pDraftX, 1e-9))
-                let u = Float.random(in: 0..<1)
-                
+                let u = Float.random(in: 0 ..< 1)
+
                 if u < acceptProb {
                     processor?.didSample(token: draftTokens[i])
                     pendingTokens.append(x)
@@ -1580,7 +1646,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
                     break
                 }
             }
-            
+
             if finalToken == nil {
                 // All drafts accepted!
                 finalToken = mainTokens[accepted ... accepted]
@@ -1590,12 +1656,35 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             pendingTokens.append(finalTokenOut.item(Int.self))
         }
 
-        // Rewind caches for rejected tokens
-        mainCacheStorage.trim(numDraft - accepted)
-        draftCacheStorage.trim(Swift.max(numDraft - accepted - 1, 0))
+        mainCommittedPendingTokenCount = accepted
+        // When every draft is accepted the draft cache still trails the main
+        // cache by one accepted token; `draftY` carries that token into the
+        // next round. Otherwise both caches contain the accepted prefix.
+        draftCommittedPendingTokenCount =
+            accepted == numDraft ? Swift.max(accepted - 1, 0) : accepted
 
-        self.acceptedDraftTokens += accepted
-        self.totalDraftTokens += draftTokens.count
+        telemetry.recordRound(
+            drafted: numDraft,
+            accepted: accepted,
+            targetVerified: numDraft + 1
+        )
+
+        // Rewind caches for rejected tokens. Committing a staged round keeps what `y` carried
+        // plus the accepted prefix and the correction token, drops the rejected tail without the
+        // live caches ever holding it, and advances the processed-token timeline to match.
+        if let round {
+            mainCacheStorage.commit(round, retaining: ySize + accepted)
+        } else {
+            mainCacheStorage.trim(numDraft - accepted)
+        }
+        let draftTrimRequest = Swift.max(numDraft - accepted - 1, 0)
+        if draftCacheStorage.trim(draftTrimRequest) < draftTrimRequest,
+            !draftCache.isEmpty
+        {
+            // A draft cache that cannot rewind (its own window wrapped) would desynchronize
+            // future proposals: stop speculating rather than draft from a corrupted history.
+            passthroughReason = "draft KV cache could not rewind rejected drafts"
+        }
 
         // Apply dynamic cache quantization after rewind
         kvCachePlan.apply(to: mainCacheStorage)
@@ -1713,7 +1802,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
     var y: LMInput.Text
     let model: any MTPLanguageModel
 
-    var state: LMOutput.State?
+    public var state: LMOutput.State?
     public let streamingError: SSDStreamingError? = nil
     var cache: [KVCache]
     var mtpCaches: [[KVCache]]
@@ -1723,8 +1812,8 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
     let sampler: LogitSampler
     let parameters: GenerateParameters
 
-    var tokenCount = 0
-    let maxTokens: Int?
+    public var tokenCount = 0
+    public let maxTokens: Int?
 
     // Number of tokens the MTP heads predict (k)
     let numMTPTokens: Int
@@ -1739,7 +1828,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
     // Internal metrics
     public var acceptedDraftTokens: Int = 0
     public var totalDraftTokens: Int = 0
-    var promptPrefillTime: TimeInterval = 0.0
+    public var promptPrefillTime: TimeInterval = 0.0
 
     /// Log-probability of the token most recently returned by `next()`.
     /// MTP speculative decoding does not currently compute per-token logprobs.
@@ -1755,9 +1844,9 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
     ) throws {
         self.y = input.text
         self.model = model
-        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.cache = try cache ?? model.newCache(parameters: parameters)
         self.mtpCaches = model.makeMTPCaches(parameters: parameters)
-        
+
         guard canTrimPromptCache(self.cache) else {
             throw KVCacheError(message: "MTP Speculative decoding requires trimmable KV caches.")
         }
@@ -1779,16 +1868,16 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         }
 
         self.promptPrefillTime = try measure {
-            try prepare(input: input, windowSize: parameters.prefillStepSize)
+            try prepare(input: input, prefill: parameters.prefill)
         }
     }
 
     /// Prefill the main model with the prompt, priming caches for generation
-    mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+    mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
         processor?.prompt(input.text.tokens)
 
         // Prefill main model
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+        switch try model.prepare(input, cache: cache, state: state, prefill: prefill) {
         case .tokens(let tokens):
             y = tokens
         case .logits(let result):
@@ -1814,7 +1903,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         var draftProcessedLogits = [MLXArray]()
         if let previousMTP = mtpLogits, !previousMTP.isEmpty {
             let countToSample = Swift.min(numDraft, previousMTP.count)
-            var draftProcessor = processor
+            var draftProcessor = processor?.copy()
             for i in 0 ..< countToSample {
                 var draftLogit = previousMTP[i]
                 draftLogit = draftProcessor?.process(logits: draftLogit) ?? draftLogit
@@ -1840,7 +1929,8 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
             y = .init(tokens: token)
 
             // Save future MTP logits for next iteration (slice to single position)
-            self.mtpLogits = mtpResult.count > 1 ? mtpResult.dropFirst().map { $0[0..., -1, 0...] } : nil
+            self.mtpLogits =
+                mtpResult.count > 1 ? mtpResult.dropFirst().map { $0[0..., -1, 0...] } : nil
 
             // Force evaluation of MTP state to prevent graph collapse
             var evalArrays = [token]
@@ -1862,8 +1952,9 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         let verifyTokens = [y.tokens] + draftTokens
         let verifyInput = LMInput.Text(tokens: concatenated(verifyTokens))
         let verifyStart = verifyInput.tokens.dim(0) - (draftTokens.count + 1)
-        
-        let mtpResult = model.callMTP(verifyInput.tokens[.newAxis], cache: cache, mtpCaches: mtpCaches)
+
+        let mtpResult = model.callMTP(
+            verifyInput.tokens[.newAxis], cache: cache, mtpCaches: mtpCaches)
         guard !mtpResult.isEmpty else { return }
 
         let mainLogits = mtpResult[0]
@@ -1879,7 +1970,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
 
         let mainTokens: MLXArray
         var mainProcessedLogits = [MLXArray]()
-        if var verifyProcessor = processor {
+        if var verifyProcessor = processor?.copy() {
             // Process sequentially
             var sampled = [MLXArray]()
             for i in 0 ..< (draftTokens.count + 1) {
@@ -1904,10 +1995,10 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         let mainTokensList = mainTokens.asArray(Int.self)
         let draftTokensList = concatenated(draftTokens).asArray(Int.self)
         var accepted = 0
-        
+
         let temp = parameters.temperature
         let finalTokenOut: MLXArray
-        
+
         if temp == 0.0 {
             // Greedy Decoding (Exact Match = Rejection Sampling at temp 0)
             for i in 0 ..< draftTokens.count {
@@ -1926,12 +2017,12 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
             var finalToken: MLXArray? = nil
             for i in 0 ..< draftTokens.count {
                 let x = draftTokensList[i]
-                
+
                 // Force evaluation of distributions for this step
                 let pTarget = MLX.softmax(mainProcessedLogits[i] / temp, axis: -1)
                 let pDraft = MLX.softmax(draftProcessedLogits[i] / temp, axis: -1)
                 eval(pTarget, pDraft)
-                
+
                 // Access scalar probability (assuming logits are [1, Vocab] or [Vocab])
                 let pTargetX: Float
                 let pDraftX: Float
@@ -1942,10 +2033,10 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
                     pTargetX = pTarget[x].item(Float.self)
                     pDraftX = pDraft[x].item(Float.self)
                 }
-                
+
                 let acceptProb = Swift.min(1.0, pTargetX / Swift.max(pDraftX, 1e-9))
-                let u = Float.random(in: 0..<1)
-                
+                let u = Float.random(in: 0 ..< 1)
+
                 if u < acceptProb {
                     processor?.didSample(token: draftTokens[i])
                     pendingTokens.append(x)
@@ -1966,7 +2057,7 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
                     break
                 }
             }
-            
+
             if finalToken == nil {
                 // All drafts accepted!
                 finalToken = mainTokens[accepted ... accepted]
@@ -2454,7 +2545,7 @@ public func generate(
 /// // Process the stream asynchronously to handle text chunks and completion info.
 /// for await generation in stream {
 ///     switch generation {
-///     case .chunk(let text, _):
+///     case .chunk(let text):
 ///         print("Generated text: \(text)")
 ///     case .info(let info):
 ///         print("Finished: \(info.tokensPerSecond) tokens/s.")
@@ -2553,29 +2644,32 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
-
-    let iterator: any TokenIteratorProtocol
-    if let mtpModel = draftModel as? DualModelMTP {
-        // Set up the dual-model MTP reference
-        mtpModel.mainModelRef = context.model as? any BaseLanguageModel
-        iterator = try MTPTokenIterator(
-            input: input,
-            model: mtpModel,
-            cache: cache,
-            parameters: parameters,
-            numMTPTokens: numDraftTokens
-        )
-    } else {
-        iterator = try SpeculativeTokenIterator(
-            input: input,
-            mainModel: context.model,
-            draftModel: draftModel,
-            mainCache: cache,
-            draftCache: draftCache,
-            parameters: parameters,
-            numDraftTokens: numDraftTokens
-        )
+    if let mtpModel = draftModel as? any DualModelMTP {
+        mtpModel.mainModelRef = context.model
+        let iterator = try MTPTokenIterator(
+            input: input, model: mtpModel, cache: cache,
+            parameters: parameters, numMTPTokens: numDraftTokens)
+        return generateTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            wiredMemoryTicket: wiredMemoryTicket,
+            tools: tools,
+            toolCallPolicy: parameters.toolCallPolicy
+        ).0
     }
+    let iterator = try SpeculativeTokenIterator(
+        input: input,
+        mainModel: context.model,
+        draftModel: draftModel,
+        mainCache: cache,
+        draftCache: draftCache,
+        mainState: state,
+        parameters: parameters,
+        numDraftTokens: numDraftTokens,
+        components: components
+    )
     let (stream, _) = generateLoopTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -2584,38 +2678,30 @@ public func generate(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
-            format: context.configuration.toolCallFormat ?? .json
+            stopStrings: context.configuration.effectiveStopStrings,
+            format: context.configuration.toolCallFormat ?? .json,
+            tools: tools,
+            toolCallPolicy: parameters.toolCallPolicy
         )
     )
     return stream
 }
 
-/// Generates text asynchronously using MTP (Multi-Token Prediction) internal speculative decoding.
-///
-/// Uses the model's built-in MTP heads to draft `numMTPTokens` candidate tokens per round and
-/// verify them in one batched forward pass — targeting 2x+ throughput with no extra VRAM.
-///
-/// - Parameters:
-///   - input: The input for the language model.
-///   - cache: optional ``KVCache``
-///   - parameters: The configuration options for token generation.
-///   - context: The model context (model must conform to ``MTPLanguageModel``).
-///   - numMTPTokens: Number of tokens the MTP heads draft per speculation round (default: 1).
-///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
-/// - Returns: An `AsyncStream` that emits `Generation` values.
-/// - Throws: An error if the iterator initialization fails.
+/// Generate tokens with the model's internal MTP heads.
 public func generateMTP(
     input: LMInput,
     cache: [KVCache]? = nil,
     parameters: GenerateParameters,
     context: ModelContext,
     numMTPTokens: Int = 1,
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
     guard let mtpModel = context.model as? (any MTPLanguageModel) else {
         // Graceful fallback: model doesn't support MTP — use standard iterator
-        return try generate(input: input, cache: cache, parameters: parameters, context: context,
-                            wiredMemoryTicket: wiredMemoryTicket)
+        return try generate(
+            input: input, cache: cache, parameters: parameters, context: context,
+            wiredMemoryTicket: wiredMemoryTicket)
     }
     let iterator = try MTPTokenIterator(
         input: input,
@@ -3160,13 +3246,16 @@ private func generateLoopTask<
             )
             stopTokenIds.formUnion(handler.additionalStopTokenIDs)
 
-            while let token = iterator.next() {
-                let tokenLogprob = iterator.lastLogprob
-                // Check for cancellation on every loop iteration.
-                if Task.isCancelled {
-                    stopReason = .cancelled
-                    break
-                }
+            // Check cancellation BEFORE iterator.next(): next() calls asyncEval() to
+            // pipeline the next GPU evaluation, so checking after it (the previous
+            // `while let token = iterator.next()` form) allowed one extra asyncEval to be
+            // submitted post-cancellation, which faults if the app has backgrounded
+            // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted). The
+            // post-loop block below assigns `.cancelled`; Stream.defaultStream.synchronize() still
+            // settles any in-flight evaluation at the end of the task body.
+            tokenLoop: while !Task.isCancelled {
+                guard let token = autoreleasepool(invoking: { iterator.next() }) else { break }
+                tokenCollector.record(token)
 
                 if promptTime == 0 {
                     let now = Date.timeIntervalSinceReferenceDate
@@ -3176,11 +3265,17 @@ private func generateLoopTask<
 
                 // Check for end-of-sequence tokens
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
-                    if includeStopToken {
-                        tokenCount += 1
-                        if !handler.onStopToken(token, logprob: tokenLogprob, emit: continuation.yield) {
-                            stopReason = .cancelled
-                            break
+                    let deliverToHandler =
+                        includeStopToken
+                        || (handler.receivesStopTokens && stopTokenIds.contains(token))
+                    if deliverToHandler {
+                        if includeStopToken {
+                            tokenCount += 1
+                            if tracksReasoningTokenCount {
+                                iterator.recordEmittedToken(token)
+                            }
+                        } else {
+                            iterator.discardGeneratedToken()
                         }
                         switch handler.onStopToken(
                             token,
@@ -3205,8 +3300,15 @@ private func generateLoopTask<
                 }
 
                 tokenCount += 1
-                if !handler.onToken(token, logprob: tokenLogprob, emit: continuation.yield) {
-                    stopReason = .cancelled
+                if tracksReasoningTokenCount {
+                    iterator.recordEmittedToken(token)
+                }
+                switch handler.onToken(
+                    token,
+                    logProbabilities: iterator.lastLogProbabilities,
+                    emit: emit)
+                {
+                case .more:
                     break
                 case .stop:
                     stopReason = .stop
@@ -3220,7 +3322,7 @@ private func generateLoopTask<
             if stopReason == nil {
                 if Task.isCancelled || iterator.streamingError != nil {
                     stopReason = .cancelled
-                } else if let maxTokens = iterator.maxTokens, tokenCount >= maxTokens {
+                } else if let maxTokens = iterator.maxTokens, iterator.tokenCount >= maxTokens {
                     stopReason = .length
                 } else {
                     stopReason = .cancelled
@@ -3252,6 +3354,8 @@ private func generateLoopTask<
             let generateTime = now - start
 
             let mtpStats = iterator as? MTPStatsCollecting
+            let hasForkDraftStats =
+                iterator is MTPTokenIterator || iterator.speculativeDecodingTelemetry != nil
             let reasoningTokenCount = iterator.reasoningTokenCount.map {
                 Swift.min(Swift.max($0, 0), tokenCount)
             }
@@ -3264,8 +3368,12 @@ private func generateLoopTask<
                 promptTime: promptTime + iterator.promptPrefillTime,
                 generationTime: generateTime,
                 stopReason: stopReason ?? .cancelled,
-                acceptedDraftTokens: iterator.acceptedDraftTokens,
-                totalDraftTokens: iterator.totalDraftTokens
+                proposedDraftTokens: mtpStats?.proposedDraftTokens
+                    ?? (hasForkDraftStats ? iterator.totalDraftTokens : nil),
+                acceptedDraftTokens: mtpStats?.acceptedDraftTokens
+                    ?? (hasForkDraftStats ? iterator.acceptedDraftTokens : nil),
+                passthroughReason: mtpStats?.passthroughReason,
+                speculativeDecodingTelemetry: iterator.speculativeDecodingTelemetry
             )
             _ = continuation.yield(handler.infoEvent(info))
 
@@ -3358,11 +3466,27 @@ public struct GenerateCompletionInfo: Sendable {
     /// Reason generation stopped.
     public let stopReason: GenerateStopReason
 
-    /// Number of accepted draft tokens (if speculative decoding is active).
-    public let acceptedDraftTokens: Int
+    /// Total tokens proposed by the MTP drafter across all speculation rounds
+    /// in this stream, or nil for non-MTP iterators. Sourced from the
+    /// iterator's ``MTPStatsCollecting`` conformance when present.
+    public let proposedDraftTokens: Int?
 
-    /// Total number of draft tokens evaluated (if speculative decoding is active).
-    public let totalDraftTokens: Int
+    public var totalDraftTokens: Int { proposedDraftTokens ?? 0 }
+
+    /// Total tokens accepted by the target across all speculation rounds in
+    /// this stream, or nil for non-MTP iterators. The acceptance rate is
+    /// `Double(acceptedDraftTokens) / Double(proposedDraftTokens)` when both
+    /// are non-nil and proposed > 0.
+    public let acceptedDraftTokens: Int?
+
+    /// Non-nil when the MTP iterator transitioned into sticky-passthrough
+    /// mode for the remainder of the stream; carries the reason string
+    /// captured at the moment of engagement. Nil if the iterator stayed
+    /// speculative for the full stream or for non-MTP streams.
+    public let passthroughReason: String?
+
+    /// Speculative decoding telemetry, when generation used speculative decoding.
+    public let speculativeDecodingTelemetry: SpeculativeDecodingTelemetry?
 
     /// Number of tool-call-shaped outputs rejected during this generation.
     public let rejectedToolCallCount: Int
@@ -3402,8 +3526,13 @@ public struct GenerateCompletionInfo: Sendable {
         promptTime: TimeInterval,
         generationTime: TimeInterval,
         stopReason: GenerateStopReason = .stop,
-        acceptedDraftTokens: Int = 0,
-        totalDraftTokens: Int = 0
+        proposedDraftTokens: Int? = nil,
+        acceptedDraftTokens: Int? = nil,
+        passthroughReason: String? = nil,
+        speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? = nil,
+        rejectedToolCallCount: Int = 0,
+        recoveredToolCallCount: Int = 0,
+        totalDraftTokens: Int? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.cachedPromptTokenCount = cachedPromptTokenCount
@@ -3414,8 +3543,12 @@ public struct GenerateCompletionInfo: Sendable {
         self.promptTime = promptTime
         self.generateTime = generationTime
         self.stopReason = stopReason
+        self.proposedDraftTokens = proposedDraftTokens ?? totalDraftTokens
         self.acceptedDraftTokens = acceptedDraftTokens
-        self.totalDraftTokens = totalDraftTokens
+        self.passthroughReason = passthroughReason
+        self.speculativeDecodingTelemetry = speculativeDecodingTelemetry
+        self.rejectedToolCallCount = rejectedToolCallCount
+        self.recoveredToolCallCount = recoveredToolCallCount
     }
 
     public func summary() -> String {
@@ -3461,14 +3594,12 @@ public struct GenerateCompletionInfo: Sendable {
 /// Represents the different stages or outputs of the token generation process.
 ///
 /// This enum distinguishes between the following:
-/// - `.chunk`: A decoded string from one or more tokens generated by the language model, along with the token ID.
+/// - `.chunk`: A decoded string from one or more tokens generated by the language model.
 /// - `.toolCall`: A tool call parsed from the generated output.
 /// - `.rejectedToolCall`: Tool-call-shaped output that was not executable.
 /// - `.info`: Metadata and performance statistics about the generation process.
 public enum Generation: Sendable {
-    /// A generated text chunk as a String, paired with the raw token ID that produced it.
-    /// The token ID can be used to detect special tokens (e.g. gpt-oss channel markers)
-    /// without relying on text matching.
+    /// Generated text with the sampled token ID and its log probability.
     case chunk(String, tokenId: Int, logprob: Float)
 
     /// Completion information summarizing token counts and performance metrics.
@@ -3493,7 +3624,7 @@ public enum Generation: Sendable {
     /// Completion info or nil
     public var info: GenerateCompletionInfo? {
         switch self {
-        case .chunk(_, _, _): nil
+        case .chunk: nil
         case .info(let info): info
         case .toolCall: nil
         case .rejectedToolCall: nil
@@ -3570,218 +3701,5 @@ public enum TokenGeneration: Sendable {
         -> [TokenGeneration]
     {
         (batch ?? []) + [element]
-    }
-}
-
-// MARK: - TokenLoopHandlers
-
-private enum TokenLoopDisposition {
-    case more
-    case stop
-    case cancelled
-
-    var shouldContinue: Bool {
-        if case .more = self { return true }
-        return false
-    }
-}
-
-private protocol TokenLoopHandler {
-    associatedtype Output
-
-    /// Semantic boundaries contributed by the response protocol handled by
-    /// this consumer. Raw-token consumers intentionally contribute none.
-    var additionalStopTokenIDs: Set<Int> { get }
-
-    /// Whether semantic parsing needs to observe EOS tokens even though they
-    /// are not included in the public output or generation token count.
-    var receivesStopTokens: Bool { get }
-
-    /// Return `.stop` for semantic generation stops, or `.cancelled` for consumer termination.
-    mutating func onToken(
-        _ token: Int,
-        logprob: Float,
-        emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    ) -> TokenLoopDisposition
-
-    /// Called when `includeStopToken` is true or ``receivesStopTokens`` is true
-    /// and a stop token was hit.
-    mutating func onStopToken(
-        _ token: Int,
-        logprob: Float,
-        emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    ) -> TokenLoopDisposition
-
-    /// Called after the token loop finishes, before the info event.
-    mutating func onGenerationEnd(
-        emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    )
-
-    func infoEvent(_ info: GenerateCompletionInfo) -> Output
-}
-
-extension TokenLoopHandler {
-    var additionalStopTokenIDs: Set<Int> { [] }
-    var receivesStopTokens: Bool { false }
-}
-
-private struct TextToolTokenLoopHandler: TokenLoopHandler {
-    typealias Output = Generation
-
-    private static let logger = Logger(
-        subsystem: "mlx-swift-lm", category: "TokenStreamProtocol")
-    private var decoder: any TokenStreamDecoder
-
-    init(
-        tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
-        tools: [[String: any Sendable]]? = nil
-    ) {
-        self.decoder = format.makeTokenStreamDecoder(
-            tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
-    }
-
-    var additionalStopTokenIDs: Set<Int> { decoder.additionalStopTokenIDs }
-    var receivesStopTokens: Bool { decoder.receivesStopTokens }
-
-    mutating func onToken(
-        _ token: Int,
-        logprob: Float,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> Bool {
-        detokenizer.append(token: token)
-        if let chunk = detokenizer.next() {
-            // Process chunk through the tool call processor.
-            if let textToYield = toolCallProcessor.processChunk(chunk) {
-                if case .terminated = emit(.chunk(textToYield, tokenId: token, logprob: logprob)) {
-                    return false
-                }
-            }
-
-            // Check if we have a complete tool call.
-            if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                if case .terminated = emit(.toolCall(toolCall)) {
-                    return false
-                }
-            }
-        }
-
-        return true
-    }
-
-    mutating func onStopToken(
-        _ token: Int,
-        logprob: Float,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        guard decoder.receivesStopTokens else { return .more }
-        return process(token, emit: emit)
-    }
-
-    mutating func onGenerationEnd(
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) {
-        var decoder = self.decoder
-        var disposition = TokenLoopDisposition.more
-        _ = decoder.finish { event in
-            disposition = process(event, emit: emit)
-            return disposition.shouldContinue
-        }
-        self.decoder = decoder
-    }
-
-    func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
-        .info(info)
-    }
-
-    private mutating func process(
-        _ token: Int,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        var decoder = self.decoder
-        var disposition = TokenLoopDisposition.more
-        let completed = decoder.push(token) { event in
-            disposition = process(event, emit: emit)
-            return disposition.shouldContinue
-        }
-        self.decoder = decoder
-
-        if disposition.shouldContinue {
-            return completed ? .more : .cancelled
-        }
-        return disposition
-    }
-
-    private mutating func process(
-        _ event: TokenStreamEvent,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        switch event {
-        case .reasoning:
-            // The public Generation stream intentionally exposes only response
-            // text and tool calls. Protocol-aware clients consume reasoning via
-            // the package-level TokenStreamDecoder contract.
-            return .more
-
-        case .response(let response):
-            if case .terminated = emit(.chunk(response)) {
-                return .cancelled
-            }
-            return .more
-
-        case .toolCall(let toolCall):
-            if case .terminated = emit(.toolCall(toolCall)) {
-                return .cancelled
-            }
-            return .more
-
-        case .protocolError(let message):
-            Self.logger.error("\(message)")
-            return .more
-
-        case .stop:
-            return .stop
-        }
-    }
-}
-
-private struct RawTokenLoopHandler: TokenLoopHandler {
-    typealias Output = TokenGeneration
-
-    let additionalStopTokenIDs: Set<Int>
-    let receivesStopTokens: Bool
-
-    init(additionalStopTokenIDs: Set<Int> = [], receivesStopTokens: Bool = false) {
-        self.additionalStopTokenIDs = additionalStopTokenIDs
-        self.receivesStopTokens = receivesStopTokens
-    }
-
-    mutating func onToken(
-        _ token: Int,
-        logprob: Float,
-        emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        if case .terminated = emit(.token(token)) {
-            return .cancelled
-        }
-        return .more
-    }
-
-    mutating func onStopToken(
-        _ token: Int,
-        logprob: Float,
-        emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) -> TokenLoopDisposition {
-        if case .terminated = emit(.token(token)) {
-            return .cancelled
-        }
-        return .more
-    }
-
-    mutating func onGenerationEnd(
-        emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) {}
-
-    func infoEvent(_ info: GenerateCompletionInfo) -> TokenGeneration {
-        .info(info)
     }
 }

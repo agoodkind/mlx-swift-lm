@@ -9,13 +9,7 @@ import Testing
 
 @testable import MLXVLM
 
-// MARK: - Video input for the base Gemma 4 (`gemma4`) VLM
-//
-// Gemma 4 has no separate video encoder: each frame runs through the same vision
-// tower as images and is trimmed to the smaller per-frame video budget
-// (`vision_soft_tokens_per_video_frame`, 70 for E4B) before scattering onto the
-// `<video>` soft-token positions (`video_token_id`, 258884). These tests cover the
-// wiring on the non-unified `Gemma4` class and its `Gemma4Processor`.
+// Video frames use the image vision tower with a per-frame maximum.
 
 struct Gemma4VideoInputTests {
 
@@ -31,9 +25,7 @@ struct Gemma4VideoInputTests {
         #expect(withoutVideo.videoTokenId == nil)
     }
 
-    /// With the per-frame video budget >= the vision tower's output length there is no
-    /// truncation, so the same pixels fed as an image and as a video produce identical
-    /// logits — proving video reuses the vision tower and scatters at `video_token_id`.
+    /// Image and video input use every feature from the shared vision tower.
     @Test("Image and video pixels scatter identically (no truncation)")
     func imageAndVideoAgree() throws {
         let model = Gemma4(try Self.makeTinyConfig(videoSoftTokens: 4))
@@ -73,10 +65,9 @@ struct Gemma4VideoInputTests {
             "Video pixels must scatter through the vision tower identically to image pixels.")
     }
 
-    /// A multi-frame video is trimmed to `visionSoftTokensPerVideoFrame` tokens per
-    /// frame, so a 2-frame clip with budget 2 scatters exactly 4 tokens.
-    @Test("Multi-frame video truncates to the per-frame budget")
-    func videoTruncatesPerFrame() throws {
+    /// Reject frames that require more features than the configured maximum.
+    @Test("Multi-frame video rejects geometry above the per-frame maximum")
+    func videoRejectsFramesAboveBudget() throws {
         let softPerFrame = 2
         let numFrames = 2
         let videoTokenId = 101
@@ -87,47 +78,16 @@ struct Gemma4VideoInputTests {
         tokens += Array(repeating: Int32(videoTokenId), count: numFrames * softPerFrame)
         tokens += [7]
         let text = LMInput.Text(tokens: MLXArray(tokens).expandedDimensions(axis: 0))
-        // 8x8 frames → 4 tower tokens per frame, truncated to the budget of 2.
         let pixels =
             (MLXArray(0 ..< (numFrames * 3 * 8 * 8)).reshaped([numFrames, 3, 8, 8])
                 .asType(.float32)) / 400.0
         let input = LMInput(text: text, video: LMInput.ProcessedVideo(pixels: pixels))
 
-        let result = try model.prepare(
-            input, cache: try model.newCache(parameters: nil), state: nil,
-            prefill: .init(stepSize: 1024))
-        guard case .logits(let out) = result else {
-            Issue.record("Expected .logits from Gemma4.prepare")
-            return
+        #expect(throws: (any Error).self) {
+            try model.prepare(
+                input, cache: try model.newCache(parameters: nil), state: nil,
+                prefill: .init(stepSize: 1024))
         }
-        eval(out.logits)
-        #expect(out.logits.shape == [1, tokens.count, 200])
-    }
-
-    /// `Gemma4Processor.processVideos` samples/preprocesses frames into a
-    /// `[totalFrames, C, H, W]` tensor at the video frame size, with per-video counts
-    /// that sum to the frame axis.
-    @Test("Processor extracts video frames to [F, C, 432, 432]")
-    func processorExtractsFrames() async throws {
-        let processor = Gemma4Processor(
-            try Self.makeProcessorConfig(), tokenizer: VideoTestTokenizer())
-
-        // Four synthetic 64x64 frames at 1s spacing.
-        let frames = (0 ..< 4).map { i in
-            UserInput.VideoFrame(
-                image: .ciImage(
-                    CIImage(color: CIColor(red: 0.3, green: 0.5, blue: 0.7))
-                        .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64))),
-                timeStamp: CMTime(value: Int64(i), timescale: 1))
-        }
-        let (pixels, frameCounts) = try await processor.processVideos(
-            [.frames(frames)], processing: nil)
-        eval(pixels)
-
-        #expect(frameCounts.count == 1)
-        #expect(pixels.dim(0) == frameCounts.reduce(0, +))
-        #expect(pixels.dim(0) >= 1)
-        #expect(Array(pixels.shape.dropFirst()) == [3, 432, 432])
     }
 
     // MARK: - Helpers
@@ -138,8 +98,6 @@ struct Gemma4VideoInputTests {
             extraLines: "\"vision_soft_tokens_per_video_frame\": \(videoSoftTokens),")
     }
 
-    /// Tiny `gemma4` config. `pooling_kernel_size 1` + `default_output_length 4` make the
-    /// vision tower emit 4 soft tokens per frame regardless of patch count.
     private static func decodeConfig(videoTokenLine: String, extraLines: String = "") throws
         -> Gemma4Configuration
     {
@@ -166,38 +124,4 @@ struct Gemma4VideoInputTests {
         return try JSONDecoder().decode(Gemma4Configuration.self, from: Data(json.utf8))
     }
 
-    private static func makeProcessorConfig() throws -> Gemma4ProcessorConfiguration {
-        let json = """
-            {
-              "processor_class": "Gemma4Processor",
-              "do_normalize": true,
-              "image_seq_length": 280,
-              "image_token_id": 258880,
-              "video_token_id": 258884,
-              "video_soft_tokens_per_frame": 70
-            }
-            """
-        return try JSONDecoder().decode(Gemma4ProcessorConfiguration.self, from: Data(json.utf8))
-    }
-}
-
-/// Minimal tokenizer so `Gemma4Processor` can be constructed; `processVideos` never
-/// touches it, and the pixel-shape tests don't exercise the chat template.
-private struct VideoTestTokenizer: Tokenizer {
-    let vocabularySize: Int = 8
-    let bosToken: String? = nil
-    let eosToken: String? = nil
-    let eosTokenId: Int? = 1
-    let unknownToken: String? = nil
-    let unknownTokenId: Int? = 0
-
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
-    func convertTokenToId(_ token: String) -> Int? { Int(token) }
-    func convertIdToToken(_ id: Int) -> String? { String(id) }
-    func applyChatTemplate(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?
-    ) throws -> [Int] { [] }
 }

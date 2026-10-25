@@ -456,6 +456,27 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
+    public override class var serializedClassName: String? { "KVCache" }
+
+    public override class func restore(
+        state: [MLXArray], metaState: [String]
+    ) throws -> any KVCache {
+        try validatePromptCache(
+            className: "KVCacheSimple", state: state, stateCounts: [0, 2],
+            metadata: metaState, metadataCounts: [1])
+        guard metaState == [""] else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: KVCacheSimple metadata must contain its single empty placeholder."
+            )
+        }
+        let cache = KVCacheSimple()
+        if !state.isEmpty {
+            cache.state = state
+        }
+        return cache
+    }
+
     public var keys: MLXArray?
     public var values: MLXArray?
     
@@ -1175,24 +1196,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             // Linearize a ring before cutting its newest rows. Also shrink oversized
             // prefill buffers: the next single-token write compacts those buffers to
             // storageCapacity and must not treat a discarded suffix as live history.
-            self.keys = temporalOrder(keys)[.ellipsis, ..<bound, 0...]
-            self.values = temporalOrder(values)[.ellipsis, ..<bound, 0...]
+            self.keys = temporallyOrdered(keys)[.ellipsis, ..<bound, 0...]
+            self.values = temporallyOrdered(values)[.ellipsis, ..<bound, 0...]
         }
         idx = bound
         offset -= trimmed
-        
-        idx -= trimmed
-        // Wrap circular buffer correctly, skipping 'keep' region
-        while idx < keep && offset >= keep {
-            // idx underflowed into the keep region (or negative). 
-            // The logical step back from 'keep' is the end of the buffer.
-            idx += (maxCacheSize - keep)
-        }
-        if offset < keep {
-            // If offset itself is within the keep region, idx and offset match.
-            idx = offset
-        }
-
+        wrappedFlag = false
         return trimmed
     }
 
@@ -1201,25 +1210,17 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         if n > 1 {
-            // Multi-token case (prefill / prompt re-encode)
-            //
-            // updateConcat temporarily allows the physical key buffer to grow to
-            // (existingKeys + n) before trimming back toward maxCacheSize + n - 1.
-            // The buffer returned to the attention layer has exactly:
-            //   physicalKeyCount = min(existingKeys + n, maxCacheSize + n - 1)
-            // columns, where existingKeys = min(offset, maxCacheSize).
-            //
-            // The mask must be [n, physicalKeyCount] wide, so we pass
-            //   offset = physicalKeyCount - n  to createCausalMask.
+            // Multi-token case. The mask must span the rows the write will present:
+            // in temporal layout that is the live rows (`idx`), which fall below the
+            // logical offset after a post-wrap trim.
             let actualWindowSize = windowSize ?? maxCacheSize
-            let existingKeys = min(offset, maxCacheSize)
-            // Physical key width the cache returns for this n-token batch
-            let physicalKeyCount = min(existingKeys + n, maxCacheSize + n - 1)
-            let maskOffset = physicalKeyCount - n
+            let liveRows = wrapped ? maxCacheSize : idx
+            let cappedOffset = min(maxCacheSize - 1, liveRows)
 
-            if maskOffset + n > actualWindowSize || returnArray {
+            // Decide if we need an array mask
+            if cappedOffset + n > actualWindowSize || returnArray {
                 return .array(
-                    createCausalMask(n: n, offset: maskOffset, windowSize: actualWindowSize))
+                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
             }
             return .causal
         } else {
@@ -1731,7 +1732,17 @@ public class ChunkedKVCache: KVCacheSimple {
 
 /// Base cache for array-based state storage
 open class ArraysCache: BaseKVCache {
-    private var cache: [MLXArray?]
+    public override class var serializedClassName: String? { "ArraysCache" }
+
+    public override class func restore(
+        state: [MLXArray], metaState: [String]
+    ) throws -> any KVCache {
+        let cache = ArraysCache(size: 0)
+        cache.restoreFromMetaState(state: state, savedMetaState: metaState)
+        return cache
+    }
+
+    fileprivate var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
     internal var lengths: MLXArray?
 
@@ -1787,9 +1798,12 @@ open class ArraysCache: BaseKVCache {
 
     /// In-place extend this cache with the other cache
     public func extend(other: ArraysCache) {
-        cache = zip(cache, other.cache).map { (c, o) in
-            if let c = c, let o = o {
-                return MLX.concatenated([c, o], axis: -2)
+        let aBatch = batchSize
+        let bBatch = other.batchSize
+
+        func concatenate(_ a: MLXArray?, _ b: MLXArray?) -> MLXArray? {
+            guard let example = a ?? b else {
+                return nil
             }
 
             let suffixShape = Array(example.shape.dropFirst())
@@ -1922,10 +1936,29 @@ open class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 open class MambaCache: ArraysCache {
+    public override class var serializedClassName: String? { "MambaCache" }
+
+    public override class func restore(
+        state: [MLXArray], metaState: [String]
+    ) throws -> any KVCache {
+        let cache = MambaCache()
+        cache.restoreFromMetaState(state: state, savedMetaState: metaState)
+        return cache
+    }
+
     /// Saved state for speculative decoding rollback.
     /// Mamba state is recurrent and cannot be partially "trimmed" like attention KV caches.
     /// Instead, we checkpoint before speculation and restore on rollback.
     private var savedState: [MLXArray]?
+
+    private struct SpeculativeCheckpoint {
+        var state: [MLXArray?]
+        var offset: Int
+        var leftPadding: MLXArray?
+        var lengths: MLXArray?
+    }
+
+    private var speculativeCheckpoint: SpeculativeCheckpoint?
 
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
@@ -1954,6 +1987,39 @@ open class MambaCache: ArraysCache {
         }
         savedState = nil  // Clear checkpoint on full acceptance
         return 0
+    }
+
+    /// Save the recurrent state at the last unconditionally committed token
+    /// inside a speculative verification pass.
+    package func saveSpeculativeCheckpoint(
+        convState: MLXArray,
+        recurrentState: MLXArray,
+        advancedBy tokenCount: Int
+    ) {
+        speculativeCheckpoint = SpeculativeCheckpoint(
+            state: [convState, recurrentState],
+            offset: offset,
+            leftPadding: leftPadding.map { $0 - tokenCount },
+            lengths: lengths.map { $0 - tokenCount })
+    }
+
+    package var hasSpeculativeCheckpoint: Bool {
+        speculativeCheckpoint != nil
+    }
+
+    @discardableResult
+    package func restoreSpeculativeCheckpoint() -> Bool {
+        guard let checkpoint = speculativeCheckpoint else { return false }
+        cache = checkpoint.state
+        offset = checkpoint.offset
+        leftPadding = checkpoint.leftPadding
+        lengths = checkpoint.lengths
+        speculativeCheckpoint = nil
+        return true
+    }
+
+    package func discardSpeculativeCheckpoint() {
+        speculativeCheckpoint = nil
     }
 
     open override func copy() -> any KVCache {
@@ -2654,21 +2720,24 @@ package func rewindSpeculativePromptCache(
 ) -> Int {
     guard numTokens == 1,
         cache.allSatisfy({ entry in
+            if let recurrent = entry as? MambaCache {
+                return recurrent.hasSpeculativeCheckpoint
+            }
             if entry.isTrimmable {
                 return entry.offset >= numTokens
             }
-            return (entry as? MambaCache)?.hasSpeculativeCheckpoint == true
+            return false
         })
     else { return 0 }
 
     for entry in cache {
-        if entry.isTrimmable {
-            guard entry.trim(numTokens) == numTokens else {
-                preconditionFailure("Speculative cache validation and rewind diverged")
+        if let recurrent = entry as? MambaCache {
+            guard recurrent.restoreSpeculativeCheckpoint() else {
+                preconditionFailure("Missing recurrent speculative checkpoint")
             }
         } else {
-            guard (entry as? MambaCache)?.restoreSpeculativeCheckpoint() == true else {
-                preconditionFailure("Missing recurrent speculative checkpoint")
+            guard entry.trim(numTokens) == numTokens else {
+                preconditionFailure("Speculative cache validation and rewind diverged")
             }
         }
     }

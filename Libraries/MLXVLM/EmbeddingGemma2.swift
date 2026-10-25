@@ -325,6 +325,11 @@ package struct EmbeddingGemma2AudioProcessor: Sendable {
         switch audio.source {
         case .array(let array):
             samples = array
+        case .data(let data, let format):
+            var processing = UserInput.AudioProcessing()
+            processing.sampleRate = Double(sampleRate)
+            samples = try await UserInput.Audio.data(data, format: format)
+                .asMLXArray(processing: processing)
         case .url(let url):
             var processing = UserInput.AudioProcessing()
             processing.sampleRate = Double(sampleRate)

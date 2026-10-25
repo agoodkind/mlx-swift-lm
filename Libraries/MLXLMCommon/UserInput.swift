@@ -260,6 +260,7 @@ public struct UserInput {
         public enum Source {
             case url(URL)
             case array(MLXArray)
+            case data(Data, format: String)
         }
 
         public var source: Source
@@ -276,18 +277,16 @@ public struct UserInput {
             Self(source: .array(array))
         }
 
+        public static func data(_ data: Data, format: String) -> Self {
+            Self(source: .data(data, format: format))
+        }
+
         // See also UserInput+Audio
     }
 
     /// Representation of the audio format.
     public enum AudioFormat: Sendable {
         case linearPCM
-    }
-
-    /// Representation of an audio resource.
-    public enum Audio: Sendable {
-        case data(Data, format: String)
-        case url(URL)
     }
 
     /// Representation of processing to apply to media.
@@ -435,6 +434,11 @@ public struct UserInput {
     /// collect the audio from the chat messages, otherwise these are the stored audio with the ``UserInput``.
     public var audio = [Audio]()
 
+    public var audios: [Audio] {
+        get { audio }
+        set { audio = newValue }
+    }
+
     public var tools: [ToolSpec]?
 
     /// Additional values provided for the chat template rendering context
@@ -456,16 +460,18 @@ public struct UserInput {
     public init(
         prompt: String, images: [Image] = [Image](), videos: [Video] = [Video](),
         audio: [Audio] = [Audio](),
+        audios: [Audio] = [Audio](),
         tools: [ToolSpec]? = nil,
         additionalContext: [String: any Sendable]? = nil
     ) {
+        let allAudio = audio + audios
         self.prompt = .chat([
-            .user(prompt, images: images, videos: videos, audio: audio)
+            .user(prompt, images: images, videos: videos, audio: allAudio)
         ])
         // note: prompt.didSet is not triggered in init
         self.images = images
         self.videos = videos
-        self.audios = audios
+        self.audio = allAudio
         self.tools = tools
         self.additionalContext = additionalContext
     }
@@ -508,13 +514,14 @@ public struct UserInput {
     public init(
         messages: [Message], images: [Image] = [Image](), videos: [Video] = [Video](),
         audio: [Audio] = [Audio](),
+        audios: [Audio] = [Audio](),
         tools: [ToolSpec]? = nil,
         additionalContext: [String: any Sendable]? = nil
     ) {
         self.prompt = .messages(messages)
         self.images = images
         self.videos = videos
-        self.audio = audio
+        self.audio = audio + audios
         self.tools = tools
         self.additionalContext = additionalContext
     }
@@ -587,6 +594,7 @@ public struct UserInput {
         images: [Image] = [Image](),
         videos: [Video] = [Video](),
         audio: [Audio] = [Audio](),
+        audios: [Audio] = [Audio](),
         processing: Processing = .init(),
         tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil
     ) {
@@ -596,9 +604,11 @@ public struct UserInput {
         case .text, .messages:
             self.images = images
             self.videos = videos
-            self.audio = audio
-        case .chat:
-            break
+            self.audio = audio + audios
+        case .chat(let messages):
+            self.images = messages.flatMap(\.images)
+            self.videos = messages.flatMap(\.videos)
+            self.audio = messages.flatMap(\.audio)
         }
         self.processing = processing
         self.tools = tools

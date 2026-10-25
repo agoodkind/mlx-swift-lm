@@ -1106,7 +1106,7 @@ public enum Qwen35Language {
         }
     }
 
-    final class Model: Module, LayerPartitionable, StreamableMoE {
+    open class Model: Module, LayerPartitionable, StreamableMoE {
         @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
         @ModuleInfo(key: "layers") fileprivate var layers: [DecoderLayer]
         @ModuleInfo(key: "norm") var norm: MathRMSNorm
@@ -1121,13 +1121,17 @@ public enum Qwen35Language {
         // StreamableMoE
         public var streamExperts: Bool = false
 
-        init(_ args: Qwen35Configuration.TextConfiguration) {
+        private let decodeSegments: [CompiledDecodeSegment]
+        private let compiledSegments: CompiledDecodeSegmentCache<Model>
+
+        public init(_ args: Qwen35Configuration.TextConfiguration) {
             precondition(args.vocabularySize > 0)
             _embedTokens.wrappedValue = Embedding(
                 embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
             let layers = (0 ..< args.hiddenLayers).map {
                 DecoderLayer(args, layerIdx: $0)
             }
+            _layers.wrappedValue = layers
             _norm.wrappedValue = MathRMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
             self.ssmIdx = layers.firstIndex(where: { $0.isLinear })
@@ -1235,14 +1239,27 @@ public enum Qwen35Language {
 
             for (index, layer) in layers.enumerated() {
                 let layerSSMMask = layer.isLinear ? ssmMask : nil
-                hiddenStates = partitionedLayerCall(index: index, gpuLayerCount: gpuLayerCount, stream: streamExperts) {
-                    layer(
-                        hiddenStates,
-                        attentionMask: faMask,
-                        ssmMask: layerSSMMask,
-                        cache: cacheArray?[index],
-                        positionIds: positionIds
-                    )
+                hiddenStates = partitionedLayerCall(
+                    index: index, gpuLayerCount: gpuLayerCount, stream: streamExperts
+                ) {
+                    if type(of: layer) == DecoderLayer.self {
+                        layer.forward(
+                            hiddenStates,
+                            attentionMask: faMask,
+                            ssmMask: layerSSMMask,
+                            cache: cacheArray?[index],
+                            positionIds: positionIds,
+                            checkpointAfter: checkpointAfter,
+                            allowCompiledDecode: allowLayerCompilation)
+                    } else {
+                        layer(
+                            hiddenStates,
+                            attentionMask: faMask,
+                            ssmMask: layerSSMMask,
+                            cache: cacheArray?[index],
+                            positionIds: positionIds,
+                            checkpointAfter: checkpointAfter)
+                    }
                 }
             }
 
@@ -1939,15 +1956,27 @@ public class Qwen35: Module, VLMModel {
         return try sanitize(weights: weights)
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var weights = weights
-        if !MTPConfig.retainMTPWeights {
-            weights = weights.filter { !$0.key.contains("mtp.") }
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        // Whether the checkpoint stores RMSNorm weights in the raw (un-shifted)
+        // convention that needs the `+1` offset. Mirrors the MLXLLM Qwen35 gate
+        // so the VLM and text paths agree: a pre-converted MLX checkpoint
+        // (conv1d already sanitized) has already been shifted at
+        // conversion time and must NOT be shifted again — doing so double-shifts
+        // every layernorm and produces garbage tokens. Computed on the incoming
+        // weights, before the `mtp.` filter below.
+        let hasUnsanitizedConv1d = weights.contains { key, value in
+            key.contains("conv1d.weight") && value.dim(-1) != 1
         }
+        // MTP tensors are not proof of a raw checkpoint: a converted checkpoint can
+        // keep them (the framework uses them for speculative decoding), and shifting
+        // its already-shifted norms a second time produces garbage tokens. The conv1d
+        // layout is the reliable signal on its own.
+        let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        if config.textConfiguration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
+        let checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            .init(weights: weights), layout: .vision,
+            tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
+        let weights = checkpoint.weights
 
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count)

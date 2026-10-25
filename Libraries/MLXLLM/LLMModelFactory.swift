@@ -686,7 +686,9 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 /// let modelContainer = try await LLMModelFactory.shared.loadContainer(
 ///     configuration: LLMRegistry.llama3_8B_4bit)
 /// ```
-public final class LLMModelFactory: ModelFactory {
+public final class LLMModelFactory: GenericModelFactory {
+    public typealias ContextType = ModelContext
+    public typealias ContainerType = ModelContainer
 
     public init(
         typeRegistry: ModelTypeRegistry<LanguageModel>, modelRegistry: AbstractModelRegistry,
@@ -800,7 +802,9 @@ public final class LLMModelFactory: ModelFactory {
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            lazyLoad: configuration.lazyLoad)
+            lazyLoad: configuration.lazyLoad,
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents)
 
         let tokenizer = try await tokenizerTask
 
@@ -826,7 +830,8 @@ public final class LLMModelFactory: ModelFactory {
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
-            messageGenerator: mutableConfiguration.messageGenerator)
+            messageGenerator: mutableConfiguration.messageGenerator,
+            lazyLoad: configuration.lazyLoad)
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

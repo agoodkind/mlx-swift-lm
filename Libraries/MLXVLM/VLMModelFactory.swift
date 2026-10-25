@@ -350,7 +350,9 @@ public typealias ModelRegistry = VLMRegistry
 /// let modelContainer = try await VLMModelFactory.shared.loadContainer(
 ///     configuration: VLMRegistry.paligemma3bMix4488bit)
 /// ```
-public final class VLMModelFactory: ModelFactory {
+public final class VLMModelFactory: GenericModelFactory {
+    public typealias ContextType = ModelContext
+    public typealias ContainerType = ModelContainer
 
     public init(
         typeRegistry: ModelTypeRegistry<LanguageModel>, processorRegistry: ProcessorTypeRegistry,
@@ -486,7 +488,9 @@ public final class VLMModelFactory: ModelFactory {
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            lazyLoad: configuration.lazyLoad)
+            lazyLoad: configuration.lazyLoad,
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents)
 
         let tokenizer = try await tokenizerTask
         let processorConfiguration: VLMProcessorConfiguration
@@ -529,7 +533,8 @@ public final class VLMModelFactory: ModelFactory {
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
-            messageGenerator: mutableConfiguration.messageGenerator)
+            messageGenerator: mutableConfiguration.messageGenerator,
+            lazyLoad: configuration.lazyLoad)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

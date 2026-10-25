@@ -99,7 +99,7 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
     // Compiled on first call rather than at init, because weights load later.
     // The lock keeps two concurrent first calls from installing rival traces.
     private let lock = NSLock()
-    private var function: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private var function: (([MLXArray]) -> [MLXArray])?
     private var tracedOwner: ObjectIdentifier?
 
     /// - Parameters:
@@ -146,7 +146,7 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
         self(owner, [argument])[0]
     }
 
-    private func compiled(_ owner: Owner) -> @Sendable ([MLXArray]) -> [MLXArray] {
+    private func compiled(_ owner: Owner) -> ([MLXArray]) -> [MLXArray] {
         let body = self.body
 
         // A snapshot is enough: `update(parameters:)`, the path optimizers and

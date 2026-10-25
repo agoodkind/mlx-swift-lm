@@ -90,7 +90,8 @@ struct EmbeddingGemma2Tests {
         let invalid = Self.tinyAudioConfig(futureContext: 0).replacingOccurrences(
             of: "[8,4]", with: "[]")
         #expect(throws: DecodingError.self) {
-            try JSONDecoder().decode(Gemma4AudioConfiguration.self, from: Data(invalid.utf8))
+            try JSONDecoder().decode(
+                MLXLMCommon.Gemma4AudioConfiguration.self, from: Data(invalid.utf8))
         }
     }
 
@@ -610,9 +611,9 @@ struct EmbeddingGemma2Tests {
     @Test(arguments: [0, 2])
     func audioTowerMatchesTransformersReference(futureContext: Int) throws {
         let config = try JSONDecoder().decode(
-            Gemma4AudioConfiguration.self,
+            MLXLMCommon.Gemma4AudioConfiguration.self,
             from: Data(Self.tinyAudioConfig(futureContext: futureContext).utf8))
-        let model = Gemma4AudioModel(config: config)
+        let model = MLXLMCommon.Gemma4AudioModel(config: config)
         var weights = try Self.deterministicWeights(for: model)
         // The shared fill would give every clip bound one value and clamp each linear
         // to a constant.

@@ -133,7 +133,7 @@ import Testing
         var info: GenerateCompletionInfo?
         for await event in stream {
             switch event {
-            case .chunk(let text):
+            case .chunk(let text, _, _):
                 #expect(info == nil)
                 output += text
             case .info(let value): info = value

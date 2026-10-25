@@ -161,7 +161,7 @@ final class TokenLoopHandlerTests: XCTestCase {
             case .probability(let value): observedTokens.append(value.chosen.token)
             case .generation(let generation):
                 switch generation {
-                case .chunk(let text): response += text
+                case .chunk(let text, _, _): response += text
                 case .toolCall(let call): calls.append(call.function)
                 case .rejectedToolCall: XCTFail("valid tool call was rejected")
                 case .info(let info): completion = info

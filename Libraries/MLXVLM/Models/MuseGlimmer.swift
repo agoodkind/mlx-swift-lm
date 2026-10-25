@@ -265,7 +265,7 @@ public struct MuseGlimmerConfiguration: Codable, Sendable {
 /// fp32 array so the two eps values in play (`rms_norm_eps` for the pre-norms,
 /// `post_norm_eps` for the post-norms) share one compiled function.
 private let _centeredRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { x, weight, eps in
+    MLXLMCommon.compile(shapeless: true) { x, weight, eps in
         let dtype = x.dtype
         let f = x.asType(.float32)
         let variance = mean(f * f, axis: -1, keepDims: true)
@@ -277,7 +277,7 @@ private let _centeredRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArr
 /// `residual + centeredRMSNorm(x)` — the post-attention / post-MLP pattern in
 /// `MuseGlimmerDecoderLayer`. Args: `[residual, x, weight, eps]`.
 private let _addCenteredRMSNorm: @Sendable ([MLXArray]) -> [MLXArray] =
-    compile(shapeless: true) { args in
+    MLXLMCommon.compile(shapeless: true) { args in
         let (residual, x, weight, eps) = (args[0], args[1], args[2], args[3])
         let dtype = x.dtype
         let f = x.asType(.float32)
@@ -289,7 +289,7 @@ private let _addCenteredRMSNorm: @Sendable ([MLXArray]) -> [MLXArray] =
 
 /// `output * sigmoid(gate)` — the attention output gate.
 private let _sigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { output, gate in
+    MLXLMCommon.compile(shapeless: true) { output, gate in
         output * sigmoid(gate)
     }
 

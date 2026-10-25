@@ -1,12 +1,77 @@
 // Copyright © 2026 Apple Inc.
 
+import AVFoundation
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXVLM
 import Testing
 
 @Suite("UserInput.Audio source")
 struct UserInputAudioTests {
+
+    @Test("Encoded audio preserves URL decoding and mono samples")
+    func encodedAudioMatchesURLDecoding() async throws {
+        let url = try makeAudioFile()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let data = try Data(contentsOf: url)
+
+        try await Device.withDefaultDevice(.cpu) {
+            let encoded = UserInput.Audio.data(data, format: "wav")
+            let reference = try MediaProcessing.extractAudioSamples(from: .url(url))
+            let compatibilitySamples = try MediaProcessing.extractAudioSamples(from: encoded)
+            var processing = UserInput.AudioProcessing()
+            processing.sampleRate = 16_000
+            let decoded = try await encoded.asMLXArray(processing: processing)
+            let decodedSamples = decoded.asArray(Float.self)
+
+            #expect(reference.count == 160)
+            #expect(compatibilitySamples == reference)
+            #expect(decodedSamples.count == reference.count)
+            for (actual, expected) in zip(decodedSamples, reference) {
+                #expect(abs(actual - expected) < 0.00001)
+            }
+            let arraySamples = try MediaProcessing.extractAudioSamples(from: .array(decoded))
+            #expect(arraySamples == decodedSamples)
+        }
+    }
+
+    @Test("Chat input preserves both public audio labels")
+    func audioLabelsPreserveChatResources() {
+        let source = UserInput.Audio.url(URL(fileURLWithPath: "/tmp/source.wav"))
+        for input in [
+            UserInput(prompt: "Listen", audio: [source]),
+            UserInput(prompt: "Listen", audios: [source]),
+            UserInput(prompt: .chat([.user("Listen", audios: [source])])),
+        ] {
+            #expect(input.audio.count == 1)
+            #expect(input.audios.count == 1)
+            guard case .chat(let messages) = input.prompt else {
+                Issue.record("Audio input did not retain its chat prompt.")
+                continue
+            }
+            #expect(messages.first?.audio.count == 1)
+            #expect(messages.first?.audios.count == 1)
+        }
+    }
+
+    private func makeAudioFile() throws -> URL {
+        let format = try #require(
+            AVAudioFormat(
+                commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
+                channels: 1, interleaved: false))
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160))
+        buffer.frameLength = 160
+        let channels = try #require(buffer.floatChannelData)
+        for index in 0 ..< 160 {
+            channels[0][index] = Float(sin(Double(index) * 0.1)) * 0.25
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        try file.write(from: buffer)
+        return url
+    }
 
     @Test("The url factory makes a url source")
     func urlFactoryMakesAURLSource() {

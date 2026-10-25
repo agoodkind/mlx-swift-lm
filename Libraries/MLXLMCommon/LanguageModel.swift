@@ -222,6 +222,10 @@ public struct LMInput {
             self.mask = mask
             self.seqLengths = seqLengths
         }
+
+        public init(samples: MLXArray) {
+            self.init(features: samples)
+        }
     }
 
     public init(tokens: MLXArray, mask: MLXArray? = nil) {
@@ -470,6 +474,18 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
     // commonly conform to ``KVCacheDimensionProvider`` while overriding ``newCache``;
     // a kvHeads-based default would mis-report those layouts. The base
     // ``LanguageModel`` implementation classifies the caches ``newCache`` builds.
+}
+
+/// Separate final hidden state computation from vocabulary projection.
+package protocol HiddenStateLanguageModel: LanguageModel {
+    /// Returns final, normalized hidden states `[batch, sequence, hidden]`.
+    func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
+
+    /// Projects hidden states `[..., hidden]` to vocabulary logits `[..., vocabulary]`.
+    ///
+    /// Include any logit scaling or soft-capping, so that projecting all positions gives the
+    /// same logits as ``LanguageModel/callAsFunction(_:cache:)``.
+    func projectLogits(_ hiddenStates: MLXArray) -> MLXArray
 }
 
 /// Interface for Language Models that support Multi-Token Prediction (MTP) for speculative decoding.

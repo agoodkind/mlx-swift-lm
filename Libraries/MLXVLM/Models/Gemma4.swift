@@ -12,6 +12,7 @@ private enum Gemma4Error: LocalizedError {
     case missingVideoTokenId
     case missingVideoTokenMapping
     case videoTokenIdMismatch(configuration: Int, tokenizer: Int)
+    case missingVideoBoundaryTokenMapping(configurationKey: String, tokenId: Int)
     case emptyVideoFrames
     case videoPlaceholderCountMismatch(videos: Int, placeholders: Int)
 
@@ -32,6 +33,9 @@ private enum Gemma4Error: LocalizedError {
             return "Gemma4 video input requires a tokenizer with a <|video|> token."
         case .videoTokenIdMismatch(let configuration, let tokenizer):
             return "Gemma4 video_token_id is \(configuration), but the tokenizer uses \(tokenizer)."
+        case .missingVideoBoundaryTokenMapping(let configurationKey, let tokenId):
+            return
+                "Gemma4 video input requires a tokenizer mapping for \(configurationKey) \(tokenId)."
         case .videoPlaceholderCountMismatch(let videos, let placeholders):
             return "Gemma4 video input contains \(videos) videos and \(placeholders) prompt placeholders."
         }
@@ -2011,6 +2015,16 @@ public struct Gemma4Processor: UserInputProcessor {
         self.tokenizer = tokenizer
     }
 
+    private func videoBoundaryToken(id: Int, configurationKey: String) throws -> String {
+        guard let token = tokenizer.convertIdToToken(id),
+            tokenizer.convertTokenToId(token) == id
+        else {
+            throw Gemma4Error.missingVideoBoundaryTokenMapping(
+                configurationKey: configurationKey, tokenId: id)
+        }
+        return token
+    }
+
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
         MLXArray, THW
     ) {
@@ -2150,6 +2164,15 @@ public struct Gemma4Processor: UserInputProcessor {
                 throw Gemma4Error.videoTokenIdMismatch(
                     configuration: configuredVideoTokenId, tokenizer: videoTokenId)
             }
+            let boiToken = try videoBoundaryToken(
+                id: config.boiTokenId, configurationKey: "boi_token_id")
+            let eoiToken: String
+            if let eoiTokenId = config.eoiTokenId {
+                eoiToken = try videoBoundaryToken(
+                    id: eoiTokenId, configurationKey: "eoi_token_id")
+            } else {
+                eoiToken = ""
+            }
             let targetSize = config.videoFrameFixedSize
             let frameTHW = THW(1, Int(targetSize.height), Int(targetSize.width))
 
@@ -2212,7 +2235,7 @@ public struct Gemma4Processor: UserInputProcessor {
                         minutes, remainingSeconds, microseconds)
                     let videoTokenString = String(
                         repeating: Self.videoPlaceholder, count: config.videoSeqLength)
-                    return "\(timestamp) \(config.boiTokenString)\(videoTokenString)\(config.eoiTokenString)"
+                    return "\(timestamp) \(boiToken)\(videoTokenString)\(eoiToken)"
                 }
                 return frames.joined(separator: " ")
             }

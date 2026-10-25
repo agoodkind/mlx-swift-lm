@@ -76,10 +76,14 @@ function verifyXcode(reportPath, selectors) {
     let functions = 0;
     let cases = 0;
     function verify(node) {
+      if (node.nodeType === 'Runtime Warning') {
+        console.warn('Xcode runtime warning: ' + node.name);
+        return;
+      }
       requireCondition(node.result === 'Passed', 'xcresult did not pass: ' + (node.nodeIdentifierURL ?? node.name) + ' (' + node.result + ')');
       if (node.nodeType === 'Test Case') {
         functions += 1;
-        if (!(node.children?.length)) cases += 1;
+        if (!(node.children ?? []).some(child => child.nodeType === 'Arguments')) cases += 1;
       }
       if (node.nodeType === 'Arguments') cases += 1;
       for (const child of node.children ?? []) verify(child);

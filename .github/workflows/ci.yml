@@ -19,7 +19,7 @@ on:
         description: Exact SwiftLM commit to validate
         type: string
         required: true
-        default: dbf4eee36701d844996038b182a272f40a41f414
+        default: 4cc594d1cc6f88116f1509cee5ba5b6a1471f0be
       run_speculative_eval:
         description: Download both models for speculative decoding evaluation (15-minute limit)
         type: boolean
@@ -44,7 +44,7 @@ env:
   DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
   CORE_REF: ${{ inputs.core_ref || '786724757aa480f049d3a913c59da7e0e61ad5dc' }}
   LIBRARY_REF: ${{ inputs.library_ref || github.event.pull_request.head.sha || github.sha }}
-  SWIFTLM_REF: ${{ inputs.swiftlm_ref || 'dbf4eee36701d844996038b182a272f40a41f414' }}
+  SWIFTLM_REF: ${{ inputs.swiftlm_ref || '4cc594d1cc6f88116f1509cee5ba5b6a1471f0be' }}
 
 jobs:
   build-and-test:
@@ -91,19 +91,6 @@ jobs:
           validate_ref core_ref "$CORE_REF"
           validate_ref library_ref "$LIBRARY_REF"
 
-      - name: Checkout CI result validation
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: ci-controls
-          sparse-checkout: .github/scripts
-          persist-credentials: false
-
-      - name: Set up Node for result validation
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
       - name: Checkout selected library source
         uses: actions/checkout@v4
         with:
@@ -127,6 +114,12 @@ jobs:
           test "$(git -C mlx-swift rev-parse HEAD)" = "$CORE_REF"
           printf 'library=%s\ncore=%s\n' "$LIBRARY_REF" "$CORE_REF" > "$RUNNER_TEMP/cohort-sources.txt"
           cat "$RUNNER_TEMP/cohort-sources.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Swift result verification
+        id: maintenance
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@12bebcd05bf2dca0110bca6e9eab818d6f664f55
+        with:
+          ref: '12bebcd05bf2dca0110bca6e9eab818d6f664f55'
 
       - name: Resolve the library dependency graph
         working-directory: mlx-swift-lm
@@ -210,7 +203,7 @@ jobs:
           while IFS= read -r suite; do
             suites+=("$suite")
           done <<< "$LIBRARY_TEST_SUITES"
-          node "$GITHUB_WORKSPACE/ci-controls/.github/scripts/verify-integration-results.mjs" xcode \
+          "${{ steps.maintenance.outputs.binary }}" verify-test-results xcode \
             "$RUNNER_TEMP/library-tests.json" "${suites[@]}"
 
       - name: Upload library source proof and test results
@@ -256,19 +249,6 @@ jobs:
           validate_ref core_ref "$CORE_REF"
           validate_ref library_ref "$LIBRARY_REF"
           validate_ref swiftlm_ref "$SWIFTLM_REF"
-
-      - name: Checkout CI result validation
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: ci-controls
-          sparse-checkout: .github/scripts
-          persist-credentials: false
-
-      - name: Set up Node for result validation
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
 
       - name: Checkout selected library source
         uses: actions/checkout@v4
@@ -323,6 +303,12 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Set up Swift result verification
+        id: maintenance
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@12bebcd05bf2dca0110bca6e9eab818d6f664f55
+        with:
+          ref: '12bebcd05bf2dca0110bca6e9eab818d6f664f55'
 
       - name: Build SwiftLM and tests in Release
         working-directory: SwiftLM
@@ -393,7 +379,7 @@ jobs:
             echo "::error::SwiftLM tests failed with exit status $status."
             exit "$status"
           fi
-          node "$GITHUB_WORKSPACE/ci-controls/.github/scripts/verify-integration-results.mjs" swiftpm \
+          "${{ steps.maintenance.outputs.binary }}" verify-test-results swiftpm \
             "$RUNNER_TEMP/swiftlm-runtime.log" "$RUNNER_TEMP/swiftlm-tests.txt" \
             PromptCacheTests MultimodalTokenExtractionTests ChatRequestParsingTests ThinkingTagStripTests OwnFeatureHTTPTests
 

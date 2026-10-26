@@ -184,6 +184,8 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public let model: LlamaModelInner
 
+    let configuration: LlamaConfiguration
+
     @ModuleInfo(key: "lm_head") public var lmHead: Linear?
 
     public init(_ args: LlamaConfiguration) {
@@ -207,9 +209,11 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         // Remove unused precomputed rotary frequencies
-        weights.filter {
-            !$0.key.contains("self_attn.rotary_emb.inv_freq")
-        }
+        filterLMHeadWeights(
+            from: weights.filter {
+                !$0.key.contains("self_attn.rotary_emb.inv_freq")
+            },
+            tiedWordEmbeddings: configuration.tieWordEmbeddings)
     }
 
     public func messageGenerator(tokenizer: any Tokenizer) -> any MessageGenerator {

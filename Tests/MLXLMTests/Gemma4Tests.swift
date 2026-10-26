@@ -310,7 +310,7 @@ extension MLXTestingSuite {
         let asstModel = Gemma4AssistantModel(asstCfg)
         asstModel.mainModelRef = mainModel
 
-        let cache = asstModel.newCache(parameters: nil)
+        let cache = try asstModel.newCache(parameters: nil)
         let input = MLXArray(0..<5).reshaped(1, 5)
         let results = asstModel.callMTP(input, cache: cache, mtpCaches: nil)
 
@@ -330,7 +330,7 @@ extension MLXTestingSuite {
         let asstModel = Gemma4AssistantModel(asstCfg)
         asstModel.mainModelRef = mainModel
 
-        let cache = asstModel.newCache(parameters: nil)
+        let cache = try asstModel.newCache(parameters: nil)
         let input = MLXArray(0..<3).reshaped(1, 3)
         let results = asstModel.callMTP(input, cache: cache, mtpCaches: nil)
 

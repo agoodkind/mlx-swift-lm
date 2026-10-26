@@ -12,13 +12,16 @@
 Using LLMs and VLMs from MLXLMCommon is as easy as:
 
 ```swift
+import Foundation
 import MLXVLM
 import MLXLMCommon
-import MLXLMHuggingFace
-import MLXLMTokenizers
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 
 let model = try await loadModel(
-    using: TokenizersLoader(),
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     id: "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
 )
 let session = ChatSession(model)
@@ -418,6 +421,44 @@ public class VLMProcessorTypeRegistry: @unchecked Sendable {
             "YourModelProcessor": create(
                 YourModelProcessorConfiguration.self, YourModelProcessor.init),
 ```
+
+### Processor metadata supplied by an external package
+
+Some repositories omit processor metadata, or declare a generic processor that is not the
+right implementation for their model type. An external model package can handle either case
+without changing `VLMModelFactory`:
+
+```swift
+struct YourModelProcessorLoadingResolver: VLMProcessorLoadingResolver {
+    func fallbackProcessorConfiguration(
+        for context: VLMProcessorLoadingContext
+    ) throws -> VLMProcessorConfiguration? {
+        guard context.modelType == "your_model" else { return nil }
+
+        let model = try JSONDecoder().decode(
+            YourModelConfiguration.self, from: context.configurationData)
+        let processor = YourModelProcessorConfiguration(model: model)
+        return VLMProcessorConfiguration(
+            data: try JSONEncoder().encode(processor),
+            processorType: "YourModelProcessor")
+    }
+
+    func processorType(
+        for context: VLMProcessorLoadingContext,
+        declaredProcessorType: String?
+    ) throws -> String? {
+        context.modelType == "your_model" ? "YourModelProcessor" : nil
+    }
+}
+
+VLMProcessorLoadingRegistry.shared.register(YourModelProcessorLoadingResolver())
+```
+
+Implement only the hook your model needs. A checkpoint's `preprocessor_config.json` or
+`processor_config.json` always wins over a generated fallback. Processor type resolution is
+applied afterward and can supply a missing `processor_class` or correct an incorrect one.
+For isolated applications and tests, pass a separate
+`VLMProcessorLoadingRegistry` to `VLMModelFactory` instead of registering globally.
 
 Add a constant for the model in the VLMRegistry (not strictly required but useful
 for callers to refer to it in code):

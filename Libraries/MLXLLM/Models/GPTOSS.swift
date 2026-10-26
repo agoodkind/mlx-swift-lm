@@ -93,7 +93,7 @@ private func swiglu(_ xLinear: MLXArray, _ xGlu: MLXArray, alpha: Float = 1.702,
     return outGlu * (xLinear + 1)
 }
 
-private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = MLXLMCommon.compile(
     shapeless: true
 ) { xLinear, xGlu in
     swiglu(xLinear, xGlu)

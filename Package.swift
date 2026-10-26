@@ -26,6 +26,9 @@ let package = Package(
             name: "MLXEmbedders",
             targets: ["MLXEmbedders"]),
         .library(
+            name: "MLXRerankers",
+            targets: ["MLXRerankers"]),
+        .library(
             name: "MLXHuggingFace",
             targets: ["MLXHuggingFace"]),
         .library(
@@ -40,6 +43,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXScriptedLM",
+            targets: ["MLXScriptedLM"]),
     ],
     traits: [
         // Gates the MLXLanguageModel adapter for Apple's FoundationModels
@@ -66,13 +72,17 @@ let package = Package(
         //   MLXFast.preadInto, prefault               (SSD streaming)
         // We MUST depend on the agoodkind fork, NOT ml-explore/mlx-swift.
         //
-        // Standalone builds track the fork's main branch. CI rewrites this to
-        // its agoodkind/mlx-swift checkout. SwiftLM integration preserves the
-        // recursive submodule pins from agoodkind/SwiftLM.
+        // Standalone builds pin the validated fork revision. Consumer builds must
+        // select the same revision for the Swift code and Metal kernels.
         // ─────────────────────────────────────────────────────────────────────────
-        .package(url: "https://github.com/agoodkind/mlx-swift.git", branch: "main"),
+        .package(
+            url: "https://github.com/agoodkind/mlx-swift.git",
+            revision: "786724757aa480f049d3a913c59da7e0e61ad5dc"),
 
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
+        .package(
+            url: "https://github.com/huggingface/swift-transformers.git",
+            revision: "c21fdcde390313a6d98d8e33a346f2c3486c3ab0"),
     ],
     targets: [
         .target(
@@ -128,6 +138,15 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MLXRerankers",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXEmbedders",
+            ],
+            path: "Libraries/MLXRerankers"
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -145,9 +164,22 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXRerankers",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Libraries/IntegrationTestHelpers",
+            exclude: ["README.md"]
+        ),
+
+        // Scripted tokenizers and models
+        .target(
+            name: "MLXScriptedLM",
+            dependencies: [
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXScriptedLM",
             exclude: ["README.md"]
         ),
         .testTarget(
@@ -160,13 +192,19 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXRerankers",
+                "MLXScriptedLM",
                 "MLXHuggingFace",
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Tests/MLXLMTests",
             exclude: [
                 "README.md"
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .copy("Resources/GemmaVideoTokenizer"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
@@ -253,7 +291,10 @@ let package = Package(
                 "MLXCXGrammar",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXGuidedGeneration"
+            path: "Libraries/MLXGuidedGeneration",
+            exclude: [
+                "README.md"
+            ]
         ),
         // Bridges Apple's FoundationModels framework to MLX-powered on-device
         // inference. Public surface is gated by @available(macOS 27 / iOS 27 /
@@ -273,7 +314,10 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXFoundationModels"
+            path: "Libraries/MLXFoundationModels",
+            exclude: [
+                "README.md"
+            ]
         ),
         .testTarget(
             name: "MLXFoundationModelsTests",

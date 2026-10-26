@@ -1,0 +1,36 @@
+{
+  "processor_class": "Gemma4Processor",
+  "image_processor": {
+    "do_normalize": false,
+    "image_mean": [
+      0,
+      0,
+      0
+    ],
+    "image_std": [
+      1,
+      1,
+      1
+    ],
+    "max_soft_tokens": 280,
+    "patch_size": 16,
+    "pooling_kernel_size": 3
+  },
+  "video_processor": {
+    "do_normalize": true,
+    "image_mean": [
+      0,
+      0,
+      0
+    ],
+    "image_std": [
+      1,
+      1,
+      1
+    ],
+    "max_soft_tokens": 70,
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "num_frames": 32
+  }
+}

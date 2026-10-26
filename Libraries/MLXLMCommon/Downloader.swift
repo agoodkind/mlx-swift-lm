@@ -76,6 +76,20 @@ public struct ResolvedModelConfiguration: Sendable {
     public var eosTokenIds: Set<Int>
     public var toolCallFormat: ToolCallFormat?
     public var lazyLoad: Bool
+    public var reasoningConfig: ReasoningConfig?
+    public var messageGenerator: (any MessageGenerator)?
+
+    /// How to choose the safetensors files holding the model's weights.
+    ///
+    /// ## See Also
+    /// - ``ModelConfiguration/weightFileSelection``
+    public var weightFileSelection: WeightFileSelection
+
+    /// Components to load the model without.
+    ///
+    /// ## See Also
+    /// - ``ModelConfiguration/excludedComponents``
+    public var excludedComponents: Set<ModelComponent>
 
     public init(
         modelDirectory: URL,
@@ -86,6 +100,10 @@ public struct ResolvedModelConfiguration: Sendable {
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int>,
         toolCallFormat: ToolCallFormat?,
+        reasoningConfig: ReasoningConfig? = nil,
+        messageGenerator: (any MessageGenerator)? = nil,
+        weightFileSelection: WeightFileSelection = .automatic,
+        excludedComponents: Set<ModelComponent> = [],
         lazyLoad: Bool = false
     ) {
         self.modelDirectory = modelDirectory
@@ -96,6 +114,10 @@ public struct ResolvedModelConfiguration: Sendable {
         self.stopStrings = stopStrings ?? extraEOSTokens
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
+        self.reasoningConfig = reasoningConfig
+        self.messageGenerator = messageGenerator
+        self.weightFileSelection = weightFileSelection
+        self.excludedComponents = excludedComponents
         self.lazyLoad = lazyLoad
     }
 }
@@ -113,6 +135,7 @@ extension ResolvedModelConfiguration {
             stopStrings: [],
             eosTokenIds: [],
             toolCallFormat: nil,
-            reasoningConfig: nil)
+            reasoningConfig: nil,
+            messageGenerator: nil)
     }
 }

@@ -4,6 +4,7 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXNN
+import MLXScriptedLM
 import XCTest
 
 /// Tests for the cancellation-before-next() ordering fix in generateLoopTask.
@@ -23,10 +24,10 @@ final class CancellationTests: XCTestCase {
     }
 
     // Stream-consumer break cancels the task via onTermination. The generation task
-    // must still settle (run Stream().synchronize()) before task.value returns.
+    // must still settle (run Stream.defaultStream.synchronize()) before task.value returns.
     func testGenerateTaskSettlesAfterStreamCancellation() async throws {
         let model = makeTinyModel()
-        let tokenizer = TestTokenizer()
+        let tokenizer = PseudoWordTokenizer()
         let configuration = ModelConfiguration(id: "test")
 
         let input = LMInput(tokens: MLXArray([1, 2, 3, 4, 5]))
@@ -44,7 +45,7 @@ final class CancellationTests: XCTestCase {
         // continuation.onTermination → task.cancel().
         for await _ in stream { break }
 
-        // Must complete without hanging. Failure here means Stream().synchronize()
+        // Must complete without hanging. Failure here means Stream.defaultStream.synchronize()
         // was not reached or the task body was not allowed to run to completion.
         await task.value
     }
@@ -54,7 +55,7 @@ final class CancellationTests: XCTestCase {
     // (or exit on the first check), then settle and complete.
     func testGenerateTaskSettlesAfterImmediateCancellation() async throws {
         let model = makeTinyModel()
-        let tokenizer = TestTokenizer()
+        let tokenizer = PseudoWordTokenizer()
         let configuration = ModelConfiguration(id: "test")
 
         let input = LMInput(tokens: MLXArray([1, 2, 3, 4, 5]))
@@ -77,7 +78,7 @@ final class CancellationTests: XCTestCase {
     // Cancellation must be reported as .cancelled in the stream's completion info.
     func testGenerateTaskReportsCancelledStopReason() async throws {
         let model = makeTinyModel()
-        let tokenizer = TestTokenizer()
+        let tokenizer = PseudoWordTokenizer()
         let configuration = ModelConfiguration(id: "test")
 
         let input = LMInput(tokens: MLXArray([1, 2, 3, 4, 5]))
@@ -107,7 +108,7 @@ final class CancellationTests: XCTestCase {
     // feeds the correct stopReason through the post-loop check.
     func testGenerateTaskReportsLengthStopReasonAtMaxTokens() async throws {
         let model = makeTinyModel()
-        let tokenizer = TestTokenizer()
+        let tokenizer = PseudoWordTokenizer()
         let configuration = ModelConfiguration(id: "test")
 
         let input = LMInput(tokens: MLXArray([1, 2, 3, 4, 5]))

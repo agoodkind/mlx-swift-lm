@@ -836,7 +836,8 @@ public struct GlmOcrProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = GlmOcrMessageGenerator().generate(from: input)
+        let messages = GlmOcrMessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools, additionalContext: input.additionalContext)
@@ -1157,6 +1158,10 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights,
+            tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
+
         // Step 1: Transform keys from HuggingFace format to internal format
         var transformed = [String: MLXArray]()
         for (key, value) in weights {
@@ -1364,12 +1369,7 @@ public struct GlmOcrMessageGenerator: MessageGenerator {
     public func generate(message: Chat.Message) -> MLXLMCommon.Message {
         var dictionary: MLXLMCommon.Message = [
             "role": message.role.rawValue,
-            "content": [
-                ["type": "text", "text": message.content]
-            ]
-                + message.images.map { _ in
-                    ["type": "image"]
-                },
+            "content": contentParts(for: message, layout: .textThenImages),
         ]
         addToolMetadata(to: &dictionary, for: message)
         return dictionary

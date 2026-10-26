@@ -1,0 +1,2 @@
+// Generated fixture for the oversized delta acceptance proof.
+// File 071 of 110. Not compiled into any target.
